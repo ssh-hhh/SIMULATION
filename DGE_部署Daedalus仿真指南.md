@@ -10,7 +10,6 @@
 > SIM=/path/to/bevy_robomaster_simulator-master
 > ```
 >
-> 脚本会自动定位（脚本同级 / 系统桌面 / 环境变量 `DGE_DIR`、`SIM_DIR` 覆盖），不写死路径。
 
 ---
 
@@ -22,6 +21,16 @@ cd "$SIM" && source ~/.cargo/env && cargo run --release
 
 # 终端 2：DGE
 cd "$DGE" && ./build/standard configs/daedalus.yaml
+```
+```bash
+# 如将文件放置桌面
+cd ~/桌面/simulation/bevy_robomaster_simulator-master
+source ~/.cargo/env && cargo run --release
+
+cd ~/桌面/DGE_vision_26
+export LD_LIBRARY_PATH=/opt/intel/openvino_2024.6.0/runtime/lib/intel64:$LD_LIBRARY_PATH^C
+./build/standard configs/daedalus.yaml
+
 ```
 
 仿真器窗口里按 **F5**（自瞄订阅开关，不开则云台指令被忽略）；按 ↑↓←→ 手动转云台、
@@ -147,4 +156,3 @@ cargo run --release -p talos-ipc --example calib -- send -135 18  # 直发指令
 
 - 弹道：DGE 用 24.5 m/s、g=9.7833；仿真器弹速 25.0、g=9.81，远距离落点有偏差，要打准可两边对齐。
 - 仿真器 Foxglove 图像限 15fps；DGE 自带 OpenCV 窗口是全速的。
-- 早期 `talos26-master` 路线已移除，仅在《环境配置与使用指南.md》留作历史记录。

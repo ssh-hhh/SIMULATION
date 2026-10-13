@@ -2,7 +2,6 @@
 
 > DGE 进程内建 Foxglove WebSocket 服务（无需 ROS/rosbridge），用于看图像、3D 跟踪场景与曲线。
 > 更新：2026-10-13。配套：《DGE_部署Daedalus仿真指南.md》。
-> 早期自定义 `/dge/*` 布局方案已废弃，以本说明和 `DGE/foxglove_layouts/` 为准。
 
 ## 1. 连接（三步）
 
