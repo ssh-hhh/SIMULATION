@@ -25,7 +25,7 @@ cd "$DGE" && ./build/standard configs/daedalus.yaml
 ```
 
 仿真器窗口里按 **F5**（自瞄订阅开关，不开则云台指令被忽略）；按 ↑↓←→ 手动转云台、
-WASD 开底盘、IJKL 移动敌方假人。一键启动：`cd "$SIM" && ./start_simulation.sh`。
+WASD 开底盘、IJKL 移动敌方假人。
 
 ## 2. 系统组成与约定
 
@@ -53,16 +53,26 @@ WASD 开底盘、IJKL 移动敌方假人。一键启动：`cd "$SIM" && ./start_
 
 ## 4. 部署
 
-```bash
-# 一次性接入 + 编译（幂等，可重复运行；详见 §5）
-bash "$SIM/setup_dge_daedalus.sh" "$DGE"
+DGE 维护仓库 **`github.com/RM-DGE/DGE_vision_26` 已包含仿真后端**，克隆后直接构建即可：
 
-# 之后只改过 DGE 源码时才需要重编译（只改 yaml 不用）
-cd "$DGE/build" && make -j"$(nproc)"
+```bash
+# 1) 取得 DGE（已含仿真后端）
+git clone https://github.com/RM-DGE/DGE_vision_26.git "$DGE"
+
+# 2) 若 OpenVINO 不在 /opt/intel/openvino_2024.6.0：
+#    编辑 "$DGE/CMakeLists.txt" 里 set(OpenVINO_DIR "...") 为你的实际路径
+
+# 3) 构建（产物 build/standard）
+cd "$DGE" && mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j"$(nproc)"
 ```
 
-重新下载/覆盖 DGE 源码后要重跑 `setup_dge_daedalus.sh`（适配层是打在源码里的）。
-⚠️ 该脚本会重新生成 `configs/daedalus.yaml`，若之后手工改过该文件，重跑前先备份。
+若你用的是**自己的 DGE 版本**：需要新增 `io/Daedalus/`（7 个文件）与 `tools/Foxglove/`，
+并对 5 个文件做小改动（`io/camera.cpp`、`io/cboard.hpp`、`io/cboard.cpp`、`src/standard.cpp`、`io/CMakeLists.txt`），
+另把 `configs/daedalus.yaml` 拷过去；具体 diff 参考维护仓库提交 `87ce5e8`（添加 daedalus）与 `69131f1`。
+
+改过 DGE 源码后重新构建：`cmake --build "$DGE/build" -j"$(nproc)"`。
+**只改 `configs/daedalus.yaml` 不需要重新编译**，直接重启 DGE 即可。
 
 ## 5. 适配层做了什么
 
@@ -129,7 +139,7 @@ cargo run --release -p talos-ipc --example calib -- send -135 18  # 直发指令
 | F5 后云台不动 | ① F5 是否开启；② 无有效目标时 DGE 发 -1 哨兵、云台保持是正常设计 |
 | 开 F5 偏向一边 / 反向 / 一动就乱摆 | 对照 §5 三条约定检查（轴系、符号、杆臂） |
 | 启动报 magic/version 不匹配 | `rm -f /tmp/talos_ipc_meta /tmp/talos_ipc_image_pool` 后重启仿真器 |
-| 仿真器黑屏/找不到 `DART.glb` | 必须 `cargo run`（或 `start_simulation.sh`），别直接跑二进制 |
+| 仿真器黑屏/找不到 `DART.glb` | 必须 `cargo run`（仓库根目录），别直接跑二进制 |
 | 识别不到敌方 | `enemy_color` 不对 / 目标不在画面 / `min_confidence` 过高 |
 | 日志偶发 `Target diverged!` | 单装甲板弱观测 + 装甲尺寸假设差（仿真 133.8×52.1 vs 假设 135×56mm）；少量可容忍 |
 

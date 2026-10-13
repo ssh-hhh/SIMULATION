@@ -1,48 +1,63 @@
 #!/usr/bin/env bash
-# DGE_vision_26 一键接入 Daedalus 仿真器
-# 用法: bash setup_dge_daedalus.sh [DGE目录]（默认 ~/桌面/DGE_vision_26）
-# 前提: ~/桌面/simulation/bevy_robomaster_simulator-master 存在（提供协议头文件）
-# 幂等：重复运行安全（已打过的补丁会跳过）
-# 详细原理见 ~/桌面/simulation/环境配置与使用指南.md 第 10 节
+# DGE_vision_26 一键接入 Daedalus 仿真器（幂等，重复运行安全）
+# 用法: bash setup_dge_daedalus.sh [DGE目录]
+#   不传参时的查找顺序: $DGE_DIR 环境变量 → 系统桌面目录/DGE_vision_26 → 本脚本同级/上级的 DGE_vision_26
+# 可选环境变量:
+#   SIM_DIR       仿真器仓库路径（缺省: 本脚本同级的 bevy_robomaster_simulator-master）
+#   OPENVINO_DIR  OpenVINO 安装目录（缺省自动探测 /opt/intel/openvino*）
+# 详细原理见同目录《DGE_部署Daedalus仿真指南.md》
 
 set -e
-DGE_DIR="${1:-$HOME/桌面/DGE_vision_26}"
-SIM_DIR="$HOME/桌面/simulation/bevy_robomaster_simulator-master"
-TALOS_DIR="$HOME/桌面/simulation/talos26-master"
-# talos26-master 可能已被删除；协议头文件的备用来源（git clone 备份）
-TALOS_FALLBACK="$HOME/.zcode/workspace/default/talos26"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-[ -d "$DGE_DIR/io" ] || { echo "DGE 目录不对: $DGE_DIR"; exit 1; }
+# ---- 定位 DGE 目录 ----
+find_dge_dir() {
+  [ -n "${DGE_DIR:-}" ] && [ -d "$DGE_DIR/io" ] && { echo "$DGE_DIR"; return; }
+  local desktop; desktop="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+  local d
+  for d in "$desktop/DGE_vision_26" "$HOME/Desktop/DGE_vision_26" \
+           "$SCRIPT_DIR/../DGE_vision_26" "$SCRIPT_DIR/DGE_vision_26"; do
+    [ -d "$d/io" ] && { echo "$d"; return; }
+  done
+  echo ""
+}
+DGE_DIR="${1:-$(find_dge_dir)}"
+[ -n "$DGE_DIR" ] && [ -d "$DGE_DIR/io" ] \
+  || { echo "找不到 DGE 目录（用法: bash $0 [DGE目录]，或设 DGE_DIR=...）"; exit 1; }
 
-# 定位协议头文件来源：优先 talos26-master，其次备份副本，最后用 DGE 里已有的
+# ---- 定位仿真器仓库（提供协议头文件）----
+SIM_DIR="${SIM_DIR:-$SCRIPT_DIR/bevy_robomaster_simulator-master}"
+[ -d "$SIM_DIR" ] \
+  || { echo "找不到仿真器仓库: $SIM_DIR（可用 SIM_DIR=... 指定）"; exit 1; }
+TALOS_DIR="${TALOS_DIR:-$SCRIPT_DIR/talos26-master}"   # 可选，早期协议头来源
+
+# 定位协议头文件来源：talos26-master（若存在）→ DGE 内已有副本
 find_src() {
   local f="$1"
-  for d in "$TALOS_DIR" "$TALOS_FALLBACK"; do
-    if [ -f "$d/crates/hardware_daedalus/src/$f" ]; then
-      echo "$d/crates/hardware_daedalus/src/$f"; return
-    fi
-  done
-  if [ -f "$DGE_DIR/io/daedalus/$f" ]; then echo "$DGE_DIR/io/daedalus/$f"; return; fi
+  if [ -f "$TALOS_DIR/crates/hardware_daedalus/src/$f" ]; then
+    echo "$TALOS_DIR/crates/hardware_daedalus/src/$f"; return
+  fi
+  if [ -f "$DGE_DIR/io/Daedalus/$f" ]; then echo "$DGE_DIR/io/Daedalus/$f"; return; fi
   echo ""
 }
 
 cd "$DGE_DIR"
 
 # ---------- 1. 协议头文件 ----------
-mkdir -p io/daedalus
+mkdir -p io/Daedalus
 SHM_LAYOUT_SRC="$(find_src shm_layout.hpp)"
 SHM_TRIPLE_SRC="$(find_src shm_triple_buffer.hpp)"
-if [ -n "$SHM_LAYOUT_SRC" ] && [ "$SHM_LAYOUT_SRC" != "$DGE_DIR/io/daedalus/shm_layout.hpp" ]; then
-  cp "$SHM_LAYOUT_SRC" io/daedalus/shm_layout.hpp
+if [ -n "$SHM_LAYOUT_SRC" ] && [ "$SHM_LAYOUT_SRC" != "$DGE_DIR/io/Daedalus/shm_layout.hpp" ]; then
+  cp "$SHM_LAYOUT_SRC" io/Daedalus/shm_layout.hpp
 fi
-if [ -n "$SHM_TRIPLE_SRC" ] && [ "$SHM_TRIPLE_SRC" != "$DGE_DIR/io/daedalus/shm_triple_buffer.hpp" ]; then
-  cp "$SHM_TRIPLE_SRC" io/daedalus/shm_triple_buffer.hpp
+if [ -n "$SHM_TRIPLE_SRC" ] && [ "$SHM_TRIPLE_SRC" != "$DGE_DIR/io/Daedalus/shm_triple_buffer.hpp" ]; then
+  cp "$SHM_TRIPLE_SRC" io/Daedalus/shm_triple_buffer.hpp
 fi
-[ -f io/daedalus/shm_layout.hpp ] && [ -f io/daedalus/shm_triple_buffer.hpp ] \
+[ -f io/Daedalus/shm_layout.hpp ] && [ -f io/Daedalus/shm_triple_buffer.hpp ] \
   || { echo "找不到 shm_layout.hpp / shm_triple_buffer.hpp（talos26 与备份均缺失）"; exit 1; }
 
 # ---------- 2. 新增文件（完整写入） ----------
-cat > io/daedalus/shm_client.hpp <<'SHM_CLIENT'
+cat > io/Daedalus/shm_client.hpp <<'SHM_CLIENT'
 #ifndef IO__DAEDALUS__SHM_CLIENT_HPP
 #define IO__DAEDALUS__SHM_CLIENT_HPP
 
@@ -227,7 +242,7 @@ private:
 #endif  // IO__DAEDALUS__SHM_CLIENT_HPP
 SHM_CLIENT
 
-cat > io/daedalus/shared.hpp <<'SHARED'
+cat > io/Daedalus/shared.hpp <<'SHARED'
 #ifndef IO__DAEDALUS__SHARED_HPP
 #define IO__DAEDALUS__SHARED_HPP
 
@@ -326,7 +341,7 @@ struct DaedalusShared
 #endif  // IO__DAEDALUS__SHARED_HPP
 SHARED
 
-cat > io/daedalus_camera.hpp <<'CAMERA_HPP'
+cat > io/Daedalus/daedalus_camera.hpp <<'CAMERA_HPP'
 #ifndef IO__DAEDALUS_CAMERA_HPP
 #define IO__DAEDALUS_CAMERA_HPP
 
@@ -351,10 +366,10 @@ public:
 #endif  // IO__DAEDALUS_CAMERA_HPP
 CAMERA_HPP
 
-cat > io/daedalus_camera.cpp <<'CAMERA_CPP'
-#include "io/daedalus_camera.hpp"
+cat > io/Daedalus/daedalus_camera.cpp <<'CAMERA_CPP'
+#include "io/Daedalus/daedalus_camera.hpp"
 
-#include "io/daedalus/shared.hpp"
+#include "io/Daedalus/shared.hpp"
 #include "tools/logger.hpp"
 
 #include <chrono>
@@ -417,15 +432,18 @@ void DaedalusCamera::read(cv::Mat & img, std::chrono::steady_clock::time_point &
 }  // namespace io
 CAMERA_CPP
 
-cat > io/daedalus_cboard.hpp <<'CBOARD_HPP'
+cat > io/Daedalus/daedalus_cboard.hpp <<'CBOARD_HPP'
 #ifndef IO__DAEDALUS_CBOARD_HPP
 #define IO__DAEDALUS_CBOARD_HPP
 
 #include <algorithm>
 #include <cmath>
 
+#include <yaml-cpp/yaml.h>
+
 #include "io/cboard.hpp"
-#include "io/daedalus/shared.hpp"
+#include "io/Daedalus/shared.hpp"
+#include "tools/math_tools.hpp"
 
 namespace io
 {
@@ -439,7 +457,15 @@ class DaedalusCBoard : public CBoardBase
 public:
   explicit DaedalusCBoard(const std::string & config_path)
   {
-    DaedalusShared::instance(config_path);  // 确保单例已初始化
+    auto & shared = DaedalusShared::instance(config_path);  // 确保单例已初始化
+    if (auto yaml = YAML::LoadFile(config_path); yaml["daedalus"]) {
+      auto d = yaml["daedalus"];
+      if (d["smooth_alpha"]) smooth_alpha_ = std::clamp(d["smooth_alpha"].as<double>(), 0.05, 1.0);
+      // 零位修正（deg）：自瞄对静止目标稳定偏向一侧时标定。
+      // 云台偏左 → yaw_trim 取正把指令往右拉；先从 ±1deg 试起。
+      if (d["yaw_trim"]) yaw_trim_ = d["yaw_trim"].as<double>() / 57.3;
+      if (d["pitch_trim"]) pitch_trim_ = d["pitch_trim"].as<double>() / 57.3;
+    }
   }
 
   Eigen::Quaterniond imu_at(std::chrono::steady_clock::time_point timestamp) override
@@ -485,12 +511,54 @@ public:
   void send(Command command) const override
   {
     auto & shared = DaedalusShared::instance("");
+
+    // 无有效目标时不要驱动仿真器云台。
+    // 仿真器 GimbalCmd 虽没有 control 使能位，但它用 distance_m == -1 表示
+    // “solver 无解”：收到后 remove::<GimbalAimTracker>()，云台不再被 PID 驱动、
+    // 原地保持（见 talos/plugin.rs process_subscription）。
+    // 旧逻辑在 control=0 时回发“当前云台姿态”，但那条路要经过 tools::eulers 反解、
+    // yaw_sign/pitch_sign、再被仿真器 from_solver_degrees 做 -90°，两者约定不同，
+    // 根本不是恒等映射 —— 结果是把云台拉到固定的错误姿态（按 F5 后“头突然摆向
+    // 一侧”就是这个）。正确做法是直接发无解哨兵，让仿真器松手。
+    if (!command.control) {
+      smoothed_ = false;
+      shared.client->send_gimbal_cmd(0.0f, 0.0f, -1.0f, false);
+      return;
+    }
+
+    if (smoothed_) {
+      // 真机云台 PID 天然滤掉指令噪声；仿真器是绝对角直通，需自行加一级
+      // 低通（EMA）抑制 EKF/选板抖动。相邻指令突变超过跳变阈值时视为
+      // 真实的装甲板切换，直通不拖延（小陀螺打板不滞后）。
+      constexpr double kJumpThreshold = 10.0 * M_PI / 180.0;
+      if (std::abs(tools::limit_rad(command.yaw - smooth_yaw_)) < kJumpThreshold)
+        command.yaw = smooth_yaw_ + smooth_alpha_ * tools::limit_rad(command.yaw - smooth_yaw_);
+      if (std::abs(command.pitch - smooth_pitch_) < kJumpThreshold)
+        command.pitch = smooth_pitch_ + smooth_alpha_ * (command.pitch - smooth_pitch_);
+    }
+    smooth_yaw_ = command.yaw;
+    smooth_pitch_ = command.pitch;
+    smoothed_ = true;
+
+    command.yaw += yaw_trim_;
+    command.pitch += pitch_trim_;
+
     constexpr double kRadToDeg = 180.0 / M_PI;
     shared.client->send_gimbal_cmd(
       static_cast<float>(shared.yaw_sign * command.yaw * kRadToDeg),
       static_cast<float>(shared.pitch_sign * command.pitch * kRadToDeg),
       static_cast<float>(command.horizon_distance), command.shoot);
   }
+
+private:
+  // 指令低通滤波状态（send 为 const，成员标记 mutable）
+  mutable double smooth_alpha_ = 0.5;
+  mutable double smooth_yaw_ = 0.0;
+  mutable double smooth_pitch_ = 0.0;
+  mutable bool smoothed_ = false;
+  // 零位修正（rad），补偿指令/反馈两条通路的恒定失配
+  double yaw_trim_ = 0.0;
+  double pitch_trim_ = 0.0;
 };
 
 }  // namespace io
@@ -498,26 +566,36 @@ public:
 #endif  // IO__DAEDALUS_CBOARD_HPP
 CBOARD_HPP
 
-# ---------- 2.5 Foxglove 可视化（官方 C++ SDK，无 ROS） ----------
-FOX_DIR="$HOME/桌面/simulation/dge_foxglove"
-FOX_SDK_ZIP="$HOME/桌面/simulation/foxglove-v0.23.0-cpp-x86_64-unknown-linux-gnu.zip"
+# ---------- 2.5 Foxglove（官方 SDK 放 io/，接口放 tools/Foxglove/） ----------
+FOX_DIR="$SCRIPT_DIR/dge_foxglove"
+# 官方 Foxglove C++ SDK 压缩包（可选；放在本目录或 ~/Downloads 均可）
+FOX_SDK_ZIP=""
+for c in "$SCRIPT_DIR"/foxglove-*-cpp-*-linux-gnu.zip "$HOME/Downloads"/foxglove-*-cpp-*-linux-gnu.zip; do
+  [ -f "$c" ] && { FOX_SDK_ZIP="$c"; break; }
+done
 if [ -f "$FOX_DIR/foxglove.cpp" ]; then
-  mkdir -p tools
-  cp "$FOX_DIR/foxglove.hpp" tools/foxglove.hpp
-  cp "$FOX_DIR/foxglove.cpp" tools/foxglove.cpp
-  echo "[ok] tools/foxglove.{hpp,cpp}"
+  mkdir -p tools/Foxglove
+  # 幂等：已有实现不覆盖（DGE 内为最新版；早期版本不得回退覆盖）
+  if [ -f tools/Foxglove/foxglove.cpp ] && [ -f tools/Foxglove/foxglove.hpp ]; then
+    echo "[skip] tools/Foxglove 已存在（保持现有实现，不覆盖）"
+  else
+    cp "$FOX_DIR/foxglove.hpp" tools/Foxglove/foxglove.hpp
+    cp "$FOX_DIR/foxglove.cpp" tools/Foxglove/foxglove.cpp
+    echo "[ok] tools/Foxglove/{foxglove.hpp,foxglove.cpp}"
+  fi
 else
-  echo "[warn] 未找到 $FOX_DIR/foxglove.cpp，跳过 Foxglove 模块"
+  echo "[warn] 未找到 $FOX_DIR/foxglove.cpp，跳过 Foxglove"
 fi
-# 官方 Foxglove C++ SDK（vendored，C++17 兼容）
-if [ -d 3dparty/foxglove/include ]; then
-  echo "[skip] 3dparty/foxglove 已存在"
+# 官方 Foxglove C++ SDK（原样 vendor 到 io/foxglove/，仿 io/hikrobot/）
+if [ -d io/foxglove/include ]; then
+  echo "[skip] io/foxglove 已存在"
 elif [ -f "$FOX_SDK_ZIP" ]; then
-  mkdir -p 3dparty
-  unzip -oq "$FOX_SDK_ZIP" -d 3dparty/
-  echo "[ok] 解压 Foxglove SDK -> 3dparty/foxglove"
+  mkdir -p io
+  unzip -oq "$FOX_SDK_ZIP" -d io/
+  echo "[ok] 解压 Foxglove SDK -> io/foxglove"
 else
-  echo "[warn] 未找到 $FOX_SDK_ZIP，无法安装 Foxglove SDK（编译会失败）"
+  echo "[warn] 未找到 Foxglove C++ SDK 压缩包（foxglove-*-cpp-*-linux-gnu.zip，放本目录或 ~/Downloads），"
+  echo "       无法安装 io/foxglove（编译会失败）；如已有 io/foxglove 可忽略本提示"
 fi
 
 # ---------- 3. 打补丁（幂等） ----------
@@ -549,8 +627,8 @@ def patch_once(path, old, new):
 # 3.1 camera.cpp: include + daedalus 分支
 patch("io/camera.cpp",
       '#include "hikrobot/hikrobot.hpp"',
-      '#include "daedalus_camera.hpp"\n#include "hikrobot/hikrobot.hpp"',
-      'daedalus_camera.hpp')
+      '#include "Daedalus/daedalus_camera.hpp"\n#include "hikrobot/hikrobot.hpp"',
+      'Daedalus/daedalus_camera.hpp')
 patch("io/camera.cpp",
       '''  else {
     throw std::runtime_error("Unknow camera_name: " + camera_name + "!");
@@ -628,8 +706,8 @@ patch("src/standard.cpp",
       '<memory>')
 patch("src/standard.cpp",
       '#include "io/cboard.hpp"',
-      '#include "io/cboard.hpp"\n#include "io/daedalus_cboard.hpp"',
-      'daedalus_cboard.hpp')
+      '#include "io/cboard.hpp"\n#include "io/Daedalus/daedalus_cboard.hpp"',
+      'io/Daedalus/daedalus_cboard.hpp')
 patch("src/standard.cpp",
       '''  io::CBoard cboard(config_path); ''',
       '''  // 仿真时在 yaml 里写 cboard_name: daedalus，真机不写或写 cboard
@@ -652,65 +730,76 @@ patch("io/CMakeLists.txt",
     cboard.cpp''',
       '''    camera.cpp
     cboard.cpp
-    daedalus_camera.cpp''',
-      'daedalus_camera.cpp')
+    Daedalus/daedalus_camera.cpp''',
+      'Daedalus/daedalus_camera.cpp')
 patch("io/CMakeLists.txt",
       '''gimbal/gimbal.cpp
 )''',
       '''gimbal/gimbal.cpp
 )
 
-# Daedalus 仿真器 IPC 适配层（协议头在 io/daedalus/，header-only，无额外链接）
-target_include_directories(io PUBLIC daedalus)''',
-      'target_include_directories(io PUBLIC daedalus)')
+# Daedalus 仿真器 IPC 适配层（协议头在 io/Daedalus/，header-only，无额外链接）
+target_include_directories(io PUBLIC Daedalus)''',
+      'target_include_directories(io PUBLIC Daedalus)')
 
-# 3.5 Foxglove: 顶层 CMakeLists.txt 加入官方 SDK 目标 + DGE 桥接库
-patch("CMakeLists.txt",
-      '''include_directories(${PROJECT_SOURCE_DIR})''',
-      '''include_directories(${PROJECT_SOURCE_DIR})
+# 3.5 Foxglove: io/CMakeLists.txt 加官方 SDK 目标（仿 hikrobot）；
+#     tools/CMakeLists.txt 加桥接层源文件与 SDK 头目录
+patch("io/CMakeLists.txt",
+      'target_include_directories(io PUBLIC Daedalus)',
+      '''target_include_directories(io PUBLIC Daedalus)
 
-##################Foxglove C++ SDK（vendored, C++17 兼容）##################
-set(FOXGLOVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3dparty/foxglove")
-set(FOXGLOVE_SOURCES
-    "${FOXGLOVE_DIR}/src/channel.cpp"
-    "${FOXGLOVE_DIR}/src/connection_graph.cpp"
-    "${FOXGLOVE_DIR}/src/context.cpp"
-    "${FOXGLOVE_DIR}/src/error.cpp"
-    "${FOXGLOVE_DIR}/src/fetch_asset.cpp"
-    "${FOXGLOVE_DIR}/src/foxglove.cpp"
-    "${FOXGLOVE_DIR}/src/mcap.cpp"
-    "${FOXGLOVE_DIR}/src/messages.cpp"
-    "${FOXGLOVE_DIR}/src/parameter.cpp"
-    "${FOXGLOVE_DIR}/src/service.cpp"
-    "${FOXGLOVE_DIR}/src/websocket.cpp"
-    "${FOXGLOVE_DIR}/src/system_info.cpp"
+# ---------- Foxglove（官方 C++ SDK，原样 vendor 在 foxglove/，用法同 hikrobot/）----------
+# 只编 SDK 的 C++ 包装层（12 个源文件）；不要用 src/*.cpp 通配，
+# 否则会引入 remote_access.cpp 的未实现 gateway 符号。
+add_library(foxglove_cpp STATIC
+    foxglove/src/channel.cpp
+    foxglove/src/connection_graph.cpp
+    foxglove/src/context.cpp
+    foxglove/src/error.cpp
+    foxglove/src/fetch_asset.cpp
+    foxglove/src/foxglove.cpp
+    foxglove/src/mcap.cpp
+    foxglove/src/messages.cpp
+    foxglove/src/parameter.cpp
+    foxglove/src/service.cpp
+    foxglove/src/websocket.cpp
+    foxglove/src/system_info.cpp
 )
-add_library(foxglove_cpp STATIC ${FOXGLOVE_SOURCES})
-target_include_directories(foxglove_cpp SYSTEM PUBLIC "${FOXGLOVE_DIR}/include")
+target_include_directories(foxglove_cpp SYSTEM PUBLIC foxglove/include)
 target_link_libraries(foxglove_cpp PUBLIC
-    "${FOXGLOVE_DIR}/lib/libfoxglove.a"
+    "${CMAKE_CURRENT_SOURCE_DIR}/foxglove/lib/libfoxglove.a"
     pthread dl m
 )
 
-# DGE 的 Foxglove 桥接层（tools/foxglove.cpp）
-add_library(dge_foxglove STATIC tools/foxglove.cpp)
-target_include_directories(dge_foxglove PUBLIC "${PROJECT_SOURCE_DIR}")
-target_link_libraries(dge_foxglove PUBLIC foxglove_cpp ${OpenCV_LIBS})''',
+target_link_libraries(io PUBLIC foxglove_cpp)''',
       'foxglove_cpp')
-patch("CMakeLists.txt",
-      'target_link_libraries(standard ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io)',
-      'target_link_libraries(standard ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io dge_foxglove)',
-      'tools io dge_foxglove')
+patch("tools/CMakeLists.txt",
+      '''    plotter.cpp
+''',
+      '''    plotter.cpp
+    Foxglove/foxglove.cpp
+''',
+      'Foxglove/foxglove.cpp')
+patch("tools/CMakeLists.txt",
+      '''    crc.cpp
+)''',
+      '''    crc.cpp
+)
+
+# tools/Foxglove 用到 io/foxglove 下的官方 SDK 头文件（库由 io 目标链接）
+target_include_directories(tools PRIVATE ${CMAKE_SOURCE_DIR}/io/foxglove/include)''',
+      'io/foxglove/include')
 
 # 3.6 standard.cpp: Foxglove 服务器 + 发布图像/识别框/调试数据
 patch("src/standard.cpp",
       '#include "tools/plotter.hpp"',
-      '#include "tools/foxglove.hpp"\n#include "tools/plotter.hpp"',
-      'tools/foxglove.hpp')
+      '#include "tools/Foxglove/foxglove.hpp"\n#include "tools/plotter.hpp"',
+      'tools/Foxglove/foxglove.hpp')
 patch("src/standard.cpp",
       '''  tools::Plotter plotter;''',
       '''  tools::Plotter plotter;
-  tools::FoxgloveServer foxglove(8765);''',
+  tools::FoxgloveServer foxglove(8765);
+  foxglove.configure_camera(config_path);''',
       'FoxgloveServer foxglove')
 patch("src/standard.cpp",
       '''    for(const auto& armor : armors) {
@@ -722,9 +811,12 @@ patch("src/standard.cpp",
             cv::line(img, armor.points[i], armor.points[(i+1)%4], {0,255,0}, 2);
     }
 
-    // Foxglove：推送（原始分辨率）图像 + 装甲板识别框
+    // Foxglove：推送（原始分辨率）图像 + 装甲板识别框 + TF + 3D 场景
     foxglove.publish_image(img);
-    foxglove.publish_annotations(armors);''',
+    foxglove.publish_annotations(armors);
+    foxglove.publish_tf(q);
+    foxglove.publish_scene(
+      armors, targets, aimer.debug_aim_point.valid, aimer.debug_aim_point.xyza);''',
       'foxglove.publish_annotations')
 patch("src/standard.cpp",
       '''    std::string text_shoot = fmt::format("Shoot: {}", command.shoot ? 1 : 0);
@@ -733,27 +825,8 @@ patch("src/standard.cpp",
     cv::putText(img, text_shoot, cv::Point(10, 60), font, scale, cv::Scalar(0, 0, 255), thickness);
 
     // Foxglove 调试曲线（Plot 面板可直接选字段）
-    {
-      nlohmann::json dbg;
-      dbg["fps"] = fps;
-      dbg["yaw"] = command.yaw;
-      dbg["pitch"] = command.pitch;
-      dbg["shoot"] = command.shoot ? 1 : 0;
-      dbg["armors"] = static_cast<int>(armors.size());
-      dbg["targets"] = static_cast<int>(targets.size());
-      if (!targets.empty()) {
-        auto x = targets.front().ekf_x();
-        dbg["ekf"] = std::vector<double>(x.data(), x.data() + x.size());
-      }
-      if (aimer.debug_aim_point.valid) {
-        auto a = aimer.debug_aim_point.xyza;
-        dbg["aim_x"] = a[0];
-        dbg["aim_y"] = a[1];
-        dbg["aim_z"] = a[2];
-        dbg["aim_yaw"] = a[3];
-      }
-      foxglove.publish_debug(dbg);
-    }''',
+    foxglove.publish_debug(
+      fps, command, targets, armors, aimer.debug_aim_point.valid, aimer.debug_aim_point.xyza);''',
       'foxglove.publish_debug')
 PATCH
 
@@ -827,21 +900,58 @@ distort_coeffs: [0, 0, 0, 0, 0]
 
 R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
 
-# 仿真器相机相对云台的安装关系（Bevy 坐标系实测换算，误差影响极小）
+# ---- 仿真器相机外参（2026-10-13 实测修正，依据 probe2 共享内存数据 + 仿真器源码）----
+# 关键事实（均可实测复现）：
+#  1) Gimbal 通道四元数已由仿真器转成 DGE/ROS 轴系（talos/plugin.rs 的 to_ros_quat），
+#     DGE 侧不能再做轴变换（见下方 daedalus.imu_left/imu_right）。
+#  2) 发布的四元数基准是 gimbal_link = 原始云台 × Rx(-65°) × Rx(+90°) = 原始云台 × Rx(25°)
+#     （SHOT_DIRECTION 的 Rx(-65°) 取自 vehicle.glb；Rx(+90°) 来自 EulerRot::ZYX(0,0,π/2)，
+#      注意 ZYX 的参数顺序是 (z,y,x)，实际是绕 X 转 90°）。
+#     实测静止时 probe2 读到 w=0.9763 —— 正是 25° 抬头，可作校验。
+#  3) 发布的 POSE_CAMERA 位置 = 相机在“原始云台系”的杆臂 = (0.060, 0.002, 0.196)。
+# 本文件 R_camera2gimbal 的基准是 gimbal_link（相机光轴 z -> link +x，REP-105 约定），
+# 因此杆臂要换算到 link 系：t = Ry(+25°) · (0.060, 0.002, 0.196) ≈ (0.137, 0.002, 0.153)。
+# 旧值 (0.153, 0.137, 0.002) 是把该值按 (z,x,y) 轴序错排的结果，
+# 等效杆臂误差 ~0.2m（gimbal_link 系内）且随云台转动方向旋转 —— 这正是：
+#   · 锁定静止目标时云台偏向一边；
+#   · 移动/转动底盘时目标世界系绕圈 → EKF 发散（[Tracker] Target diverged!）→ 云台乱摆
+# 的根因。验证：锁定静止目标后缓慢转动云台，Foxglove /dge/scene 里装甲板方块应世界系原地不动。
 R_camera2gimbal: [0, 0, 1, -1, 0, 0, 0, -1, 0]
-t_camera2gimbal: [0.196, 0.06, 0.002]
+t_camera2gimbal: [0.1374, 0.0020, 0.1526]
 
 #####-----云台后端-----#####
 cboard_name: "daedalus"   # 走共享内存发云台指令（真机删掉此行用串口 CBoard）
 
-# Daedalus 适配参数：实测仿真器 yaw 正方向为向右转，与 DGE 相反，故 yaw_sign=-1（2026-10-11 标定）
+# Daedalus 适配参数。2026-10-13 实测修正：
+#  · imu_left/imu_right 必须为单位四元数：仿真器发布的四元数已是 DGE/ROS 轴系，
+#    DGE 再乘一次 (0.5,0.5,0.5,0.5) 会把 25° 抬头映射成 25° yaw
+#    （calib watch 打印的 V1 yaw=-25.0 就是此错），云台因此“一边偏”。
+#  · yaw_sign/pitch_sign 均为 +1：仿真器接受的是世界方位角（绕 +Z、+X 为前方）
+#    和“抬头为负”的 pitch（cmd.pitch_deg = -仰角），与 DGE aimer 输出同号。
+#    之前标出的 -1/-1 是在错误轴系下凑出来的，改正轴系后必须置 +1，否则云台反向。
 daedalus:
-  yaw_sign: -1
-  pitch_sign: -1
-  # imu_left: [0.5, 0.5, 0.5, 0.5]    # Bevy→DGE 轴变换四元数（一般不用动）
-  # imu_right: [0.5, 0.5, 0.5, 0.5]
+  yaw_sign: 1
+  pitch_sign: 1
+  imu_left: [1, 0, 0, 0]
+  imu_right: [1, 0, 0, 0]
 YAML
 
 echo ""
 echo "===== 全部就绪，开始编译 ====="
-mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1 && make -j12 2>&1 | grep -E "error|Built target standard" | tail -5
+# OpenVINO 路径：自动探测并写入 CMakeLists（不同机器安装位置可能不同）
+if [ -z "${OPENVINO_DIR:-}" ]; then
+  for c in /opt/intel/openvino_2024.6.0 /opt/intel/openvino; do
+    [ -d "$c/runtime/cmake" ] && { OPENVINO_DIR="$c"; break; }
+  done
+fi
+if [ -n "${OPENVINO_DIR:-}" ] && grep -q 'set(OpenVINO_DIR' CMakeLists.txt 2>/dev/null; then
+  want="set(OpenVINO_DIR \"$OPENVINO_DIR/runtime/cmake/\")"
+  if ! grep -qF "$want" CMakeLists.txt; then
+    sed -i "s|^set(OpenVINO_DIR .*|$want|" CMakeLists.txt
+    echo "[ok] CMakeLists.txt: $want"
+  fi
+fi
+
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release > cmake.log 2>&1 || { tail -30 cmake.log; exit 1; }
+make -j"$(nproc)" 2>&1 | grep -E "error|Built target standard" | tail -5

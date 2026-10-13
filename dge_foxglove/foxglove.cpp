@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include <foxglove/channel.hpp>
 #include <foxglove/context.hpp>
 #include <foxglove/messages.hpp>
@@ -20,6 +22,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "tools/logger.hpp"
+#include "tools/math_tools.hpp"
 
 namespace tools
 {
@@ -49,17 +52,35 @@ Quaternion make_quaternion(const Eigen::Quaterniond & q)
   return Quaternion{q.x(), q.y(), q.z(), q.w()};
 }
 
+Vector3 make_vector3(double x, double y, double z) { return Vector3{x, y, z}; }
+
 // 绕 Z 轴 yaw 的位姿（DGE 世界系：x 前、y 左、z 上）
 Pose make_pose(double x, double y, double z, double yaw)
 {
   Pose pose;
-  pose.position = Vector3{x, y, z};
+  pose.position = make_vector3(x, y, z);
   const Eigen::Quaterniond q(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
   pose.orientation = make_quaternion(q);
   return pose;
 }
 
-Vector3 make_vector3(double x, double y, double z) { return Vector3{x, y, z}; }
+// yaw + pitch（Rz*Ry，法线沿局部 +x），与 Solver::reproject_armor 的板面约定一致
+Pose make_pose_ypr(double x, double y, double z, double yaw, double pitch)
+{
+  Pose pose;
+  pose.position = make_vector3(x, y, z);
+  const Eigen::Quaterniond q =
+    Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY());
+  pose.orientation = make_quaternion(q);
+  return pose;
+}
+
+// Solver 的板面俯仰约定：outpost -15°，其余 +15°
+double armor_pitch(auto_aim::ArmorName name)
+{
+  return (name == auto_aim::outpost) ? -15.0 * M_PI / 180.0 : 15.0 * M_PI / 180.0;
+}
 
 Color make_color(double r, double g, double b, double a = 1.0) { return Color{r, g, b, a}; }
 
@@ -84,6 +105,55 @@ Color armor_color(auto_aim::Color color)
   default: return kDetectedOther;
   }
 }
+
+// 指向任意方向的箭头：pose 在箭尾，+x 旋转到 (tip - tail)
+ArrowPrimitive make_arrow(
+  const Eigen::Vector3d & tail, const Eigen::Vector3d & tip, double shaft_diameter,
+  const Color & color)
+{
+  const Eigen::Vector3d d = tip - tail;
+  const double len = d.norm();
+
+  ArrowPrimitive arrow;
+  Pose pose;
+  pose.position = make_vector3(tail.x(), tail.y(), tail.z());
+  if (len > 1e-6) {
+    const Eigen::Quaterniond q =
+      Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitX(), d.normalized());
+    pose.orientation = make_quaternion(q);
+  } else {
+    pose.orientation = Quaternion{0.0, 0.0, 0.0, 1.0};
+  }
+  arrow.pose = pose;
+  arrow.shaft_length = len;
+  arrow.shaft_diameter = shaft_diameter;
+  arrow.head_length = std::min(0.12, len * 0.3);
+  arrow.head_diameter = shaft_diameter * 2.5;
+  arrow.color = color;
+  return arrow;
+}
+
+// 目标旋转中心（x[0],x[2],x[4]）+ 高度差中点
+Eigen::Vector3d target_center(const Eigen::VectorXd & x)
+{
+  return Eigen::Vector3d(x[0], x[2], x[4] + x[10] / 2.0);
+}
+
+// 当前离云台最近的那块装甲板中心（瞄准器实际跟随的装甲板）
+Eigen::Vector3d nearest_armor_xyz(const auto_aim::Target & target)
+{
+  Eigen::Vector3d best = Eigen::Vector3d::Zero();
+  double best_dist = 1e18;
+  for (const auto & xyza : target.armor_xyza_list()) {
+    const double dist = xyza.head<2>().norm();
+    if (dist < best_dist) {
+      best_dist = dist;
+      best = xyza.head<3>();
+    }
+  }
+  return best;
+}
+
 
 // ---------------------------------------------------------------------------
 // ROS2 CDR (XCDR1, little-endian, 无 encapsulation header) 序列化。
@@ -357,6 +427,7 @@ struct FoxgloveServer::Impl
   std::optional<CameraCalibrationChannel> camera_info_ch;
   std::optional<FrameTransformsChannel> tf_ch;
   std::optional<SceneUpdateChannel> scene_ch;
+  std::optional<SceneUpdateChannel> prediction_ch;       // /dge/prediction
   std::optional<foxglove::RawChannel> rm_target_ch;
   std::optional<foxglove::RawChannel> rm_info_ch;
   std::optional<foxglove::RawChannel> rm_armors_ch;
@@ -366,6 +437,11 @@ struct FoxgloveServer::Impl
   std::vector<foxglove::Parameter> parameters;             // Parameters 面板
 
   uint64_t last_image_ns = 0;
+
+  // 上一帧跟踪状态（/tracker/info 的抖动指标 position_diff / yaw_diff）
+  bool has_last_target = false;
+  Eigen::Vector3d last_center = Eigen::Vector3d::Zero();
+  double last_yaw = 0.0;
 
   // 相机外参：gimbal_link -> camera_optical_frame
   Eigen::Vector3d camera_translation = Eigen::Vector3d::Zero();
@@ -471,6 +547,12 @@ FoxgloveServer::FoxgloveServer(int port, std::string name) : impl_(std::make_uni
     impl_->scene_ch = std::move(*ch);
   } else {
     logger()->error("foxglove: create /dge/scene: {}", foxglove::strerror(ch.error()));
+  }
+
+  if (auto ch = SceneUpdateChannel::create("/dge/prediction", impl_->context); ch) {
+    impl_->prediction_ch = std::move(*ch);
+  } else {
+    logger()->error("foxglove: create /dge/prediction: {}", foxglove::strerror(ch.error()));
   }
 
   const std::string & object_schema_text = []() -> const std::string & {
@@ -624,14 +706,14 @@ void FoxgloveServer::publish_tf(const Eigen::Quaterniond & gimbal_world_q)
 
 void FoxgloveServer::publish_scene(
   const std::list<auto_aim::Armor> & armors, const std::list<auto_aim::Target> & targets,
-  bool aim_valid, const Eigen::Vector4d & aim_xyza)
+  bool aim_valid, const Eigen::Vector4d & aim_xyza, const Eigen::Quaterniond & gimbal_world_q)
 {
   if (!impl_->scene_ch || !has_clients()) return;
 
   const uint64_t ns = now_ns();
   SceneUpdate update;
 
-  // 检测到的装甲板
+  // 检测到的装甲板（识别器原始输出）
   {
     SceneEntity entity;
     entity.timestamp = to_timestamp(ns);
@@ -641,9 +723,9 @@ void FoxgloveServer::publish_scene(
 
     for (const auto & armor : armors) {
       CubePrimitive cube;
-      cube.pose = make_pose(
+      cube.pose = make_pose_ypr(
         armor.xyz_in_world.x(), armor.xyz_in_world.y(), armor.xyz_in_world.z(),
-        armor.ypr_in_world[0]);
+        armor.ypr_in_world[0], armor.ypr_in_world[1]);
       cube.size = armor_size(armor.type);
       cube.color = armor_color(armor.color);
       entity.cubes.push_back(cube);
@@ -651,7 +733,7 @@ void FoxgloveServer::publish_scene(
     update.entities.push_back(std::move(entity));
   }
 
-  // 跟踪目标：预测的各装甲板 + 中心
+  // 跟踪目标：估计的各装甲板 + 旋转中心 + 旋转圆 + 速度箭头 + 标签
   {
     SceneEntity entity;
     entity.timestamp = to_timestamp(ns);
@@ -661,38 +743,120 @@ void FoxgloveServer::publish_scene(
 
     if (!targets.empty()) {
       const auto & target = targets.front();
+      const auto x = target.ekf_x();
       const auto xyza_list = target.armor_xyza_list();
+      const Eigen::Vector3d center = target_center(x);
 
-      double cx = 0.0, cy = 0.0, cz = 0.0;
+      // 各装甲板位置（半透明立方体，带板面俯仰）
       for (const auto & xyza : xyza_list) {
         CubePrimitive cube;
-        cube.pose = make_pose(xyza[0], xyza[1], xyza[2], xyza[3]);
+        cube.pose = make_pose_ypr(xyza[0], xyza[1], xyza[2], xyza[3], armor_pitch(target.name));
         cube.size = armor_size(target.armor_type);
         cube.color = make_color(kTracked.r, kTracked.g, kTracked.b, 0.45);
         entity.cubes.push_back(cube);
-
-        cx += xyza[0];
-        cy += xyza[1];
-        cz += xyza[2];
       }
 
-      if (!xyza_list.empty()) {
-        const double n = static_cast<double>(xyza_list.size());
-        cx /= n;
-        cy /= n;
-        cz /= n;
+      // 旋转中心
+      SpherePrimitive center_sphere;
+      center_sphere.pose = make_pose(center.x(), center.y(), center.z(), 0.0);
+      center_sphere.size = make_vector3(0.10, 0.10, 0.10);
+      center_sphere.color = kTracked;
+      entity.spheres.push_back(center_sphere);
 
-        SpherePrimitive center;
-        center.pose = make_pose(cx, cy, cz, 0.0);
-        center.size = make_vector3(0.12, 0.12, 0.12);
-        center.color = make_color(kTracked.r, kTracked.g, kTracked.b, 0.6);
-        entity.spheres.push_back(center);
+      // 旋转圆环：r1（蓝）位于下排装甲板高度，r2（橙）位于上排高度
+      const double radius = x[8];
+      const double radius_2 = (xyza_list.size() >= 4) ? x[8] + x[9] : x[8];
+      const double r1_z = x[4];
+      const double r2_z = x[4] + x[10];
+      constexpr int kSegments = 48;
+      const auto add_ring = [&](double r, double z, const Color & color) {
+        if (r <= 0.02) return;
+        LinePrimitive ring;
+        ring.type = LinePrimitive::LineType::LINE_LOOP;
+        ring.thickness = 0.01;
+        ring.color = color;
+        for (int i = 0; i < kSegments; ++i) {
+          const double a = i * 2.0 * M_PI / kSegments;
+          ring.points.push_back(
+            Point3{x[0] + r * std::cos(a), x[2] + r * std::sin(a), z});
+        }
+        entity.lines.push_back(ring);
+      };
+      add_ring(radius, r1_z, make_color(0.38, 0.65, 1.0, 0.6));
+      if (radius_2 > radius + 0.005) add_ring(radius_2, r2_z, make_color(1.0, 0.57, 0.25, 0.6));
+
+      // 旋转中心到各估计装甲板的辐条（展示四板相对位置）
+      for (const auto & xyza : xyza_list) {
+        LinePrimitive spoke;
+        spoke.type = LinePrimitive::LineType::LINE_STRIP;
+        spoke.thickness = 0.005;
+        spoke.color = make_color(0.6, 0.65, 0.75, 0.35);
+        spoke.points.push_back(Point3{center.x(), center.y(), center.z()});
+        spoke.points.push_back(Point3{xyza[0], xyza[1], xyza[2]});
+        entity.lines.push_back(spoke);
       }
+
+      // 线速度箭头
+      const Eigen::Vector3d vel(x[1], x[3], x[5]);
+      if (vel.norm() > 0.05) {
+        entity.arrows.push_back(
+          make_arrow(center, center + vel, 0.03, make_color(1.0, 0.9, 0.1, 1.0)));
+      }
+
+      // 角速度箭头（沿 +z，长度随 |v_yaw| 变化）
+      const double v_yaw = x[7];
+      if (std::abs(v_yaw) > 0.2) {
+        const double len = std::min(1.0, std::abs(v_yaw) * 0.1);
+        const Eigen::Vector3d tip = center + Eigen::Vector3d(0.0, 0.0, std::copysign(len, v_yaw));
+        entity.arrows.push_back(
+          make_arrow(center, tip, 0.02, make_color(0.2, 1.0, 1.0, 1.0)));
+      }
+
+      // 目标标签
+      TextPrimitive text;
+      text.pose = make_pose(center.x(), center.y(), center.z() + 0.45, 0.0);
+      text.billboard = true;
+      text.scale_invariant = true;
+      text.font_size = 14.0;
+      text.color = kTracked;
+      text.text = fmt::format(
+        "{} | v_yaw={:+.1f}rad/s\nr1={:.3f}m r2={:.3f}m",
+        auto_aim::ARMOR_NAMES.at(static_cast<size_t>(target.name)), v_yaw, radius, radius_2);
+      entity.texts.push_back(std::move(text));
     }
     update.entities.push_back(std::move(entity));
   }
 
-  // 瞄准点 + 指向线
+  // 自车云台：光轴 / 相机朝向（"self"）
+  {
+    SceneEntity entity;
+    entity.timestamp = to_timestamp(ns);
+    entity.frame_id = "odom";
+    entity.id = "self";
+    entity.frame_locked = false;
+
+    // 云台 +x 指向（odom 系）
+    const Eigen::Vector3d gimbal_dir = gimbal_world_q * Eigen::Vector3d::UnitX();
+    entity.arrows.push_back(
+      make_arrow(Eigen::Vector3d::Zero(), gimbal_dir * 1.5, 0.02, make_color(0.2, 0.9, 1.0, 0.9)));
+
+    // 相机光轴（相机坐标系 +z）
+    const Eigen::Vector3d camera_dir =
+      gimbal_world_q * (impl_->camera_rotation * Eigen::Vector3d::UnitZ());
+    entity.arrows.push_back(make_arrow(
+      impl_->camera_translation, impl_->camera_translation + camera_dir * 1.5, 0.015,
+      make_color(1.0, 0.3, 1.0, 0.7)));
+
+    SpherePrimitive origin;
+    origin.pose = make_pose(0.0, 0.0, 0.0, 0.0);
+    origin.size = make_vector3(0.08, 0.08, 0.08);
+    origin.color = make_color(0.2, 0.9, 1.0, 1.0);
+    entity.spheres.push_back(origin);
+
+    update.entities.push_back(std::move(entity));
+  }
+
+  // 瞄准点 + 指向线 / 箭头
   {
     SceneEntity entity;
     entity.timestamp = to_timestamp(ns);
@@ -703,30 +867,95 @@ void FoxgloveServer::publish_scene(
     if (aim_valid) {
       SpherePrimitive point;
       point.pose = make_pose(aim_xyza[0], aim_xyza[1], aim_xyza[2], aim_xyza[3]);
-      point.size = make_vector3(0.06, 0.06, 0.06);
+      point.size = make_vector3(0.07, 0.07, 0.07);
       point.color = kAim;
       entity.spheres.push_back(point);
 
-      LinePrimitive line;
-      line.type = LinePrimitive::LineType::LINE_STRIP;
-      line.thickness = 0.01;
-      line.color = make_color(kAim.r, kAim.g, kAim.b, 0.5);
-      Point3 origin;
-      origin.x = 0.0;
-      origin.y = 0.0;
-      origin.z = 0.0;
-      Point3 tip;
-      tip.x = aim_xyza[0];
-      tip.y = aim_xyza[1];
-      tip.z = aim_xyza[2];
-      line.points.push_back(origin);
-      line.points.push_back(tip);
-      entity.lines.push_back(line);
+      const Eigen::Vector3d aim(aim_xyza[0], aim_xyza[1], aim_xyza[2]);
+      entity.arrows.push_back(
+        make_arrow(Eigen::Vector3d::Zero(), aim, 0.012, make_color(kAim.r, kAim.g, kAim.b, 0.8)));
+
+      TextPrimitive text;
+      text.pose = make_pose(aim.x(), aim.y(), aim.z() + 0.15, 0.0);
+      text.billboard = true;
+      text.scale_invariant = true;
+      text.font_size = 12.0;
+      text.color = kAim;
+      text.text = "aim";
+      entity.texts.push_back(std::move(text));
     }
     update.entities.push_back(std::move(entity));
   }
 
   impl_->scene_ch->log(update, ns);
+}
+
+void FoxgloveServer::publish_prediction(
+  const std::list<auto_aim::Target> & targets, double horizon_s, double step_s)
+{
+  if (!impl_->prediction_ch || !has_clients()) return;
+  if (step_s <= 0.0) step_s = 0.02;
+
+  const uint64_t ns = now_ns();
+  SceneUpdate update;
+
+  SceneEntity entity;
+  entity.timestamp = to_timestamp(ns);
+  entity.frame_id = "odom";
+  entity.id = "target_prediction";
+  entity.frame_locked = false;
+
+  const int steps = std::max(1, static_cast<int>(horizon_s / step_s));
+
+  for (const auto & target : targets) {
+    // 复制一份目标，向前预测，不影响主流程的估计器状态
+    auto predictor = target;
+
+    // 最近装甲板轨迹（瞄准器实际跟随的轨迹，小陀螺时会跳变）
+    LinePrimitive armor_path;
+    armor_path.type = LinePrimitive::LineType::LINE_STRIP;
+    armor_path.thickness = 0.008;
+    armor_path.color = make_color(1.0, 0.85, 0.1, 0.9);
+    // 旋转中心轨迹（平移量，平滑）
+    LinePrimitive center_path;
+    center_path.type = LinePrimitive::LineType::LINE_STRIP;
+    center_path.thickness = 0.006;
+    center_path.color = make_color(1.0, 0.85, 0.1, 0.4);
+
+    const auto add_sample = [&](double frac) {
+      const Eigen::Vector3d armor_xyz = nearest_armor_xyz(predictor);
+      const Eigen::Vector3d center = target_center(predictor.ekf_x());
+      armor_path.points.push_back(Point3{armor_xyz.x(), armor_xyz.y(), armor_xyz.z()});
+      center_path.points.push_back(Point3{center.x(), center.y(), center.z()});
+    };
+
+    add_sample(0.0);
+    for (int i = 1; i <= steps; ++i) {
+      predictor.predict(step_s);
+      add_sample(static_cast<double>(i) / steps);
+    }
+
+    entity.lines.push_back(std::move(armor_path));
+    entity.lines.push_back(std::move(center_path));
+
+    // 未来若干时刻的幽灵装甲板（预测位置）
+    auto ghost = target;
+    const int ghost_stride = std::max(1, steps / 3);
+    for (int i = 1; i <= steps; i += ghost_stride) {
+      ghost.predict(step_s * ghost_stride);
+      const double frac = static_cast<double>(i) / steps;
+      for (const auto & xyza : ghost.armor_xyza_list()) {
+        CubePrimitive cube;
+        cube.pose = make_pose(xyza[0], xyza[1], xyza[2], xyza[3]);
+        cube.size = armor_size(ghost.armor_type);
+        cube.color = make_color(1.0, 0.85, 0.1, 0.35 * (1.0 - frac) + 0.05);
+        entity.cubes.push_back(cube);
+      }
+    }
+  }
+
+  update.entities.push_back(std::move(entity));
+  impl_->prediction_ch->log(update, ns);
 }
 
 void FoxgloveServer::publish_image(const cv::Mat & bgr, int quality)
@@ -851,6 +1080,7 @@ void FoxgloveServer::publish_rmvision(
     const auto data = msg.dump();
     impl_->rm_armors_ch->log(reinterpret_cast<const std::byte *>(data.data()), data.size(), ns);
   }
+  nlohmann::json info_header = {{"stamp", {{"sec", ns / 1000000000ULL}, {"nanosec", ns % 1000000000ULL}}}};
   if (impl_->rm_target_ch) {
     nlohmann::json msg = {{"header", header}, {"tracking", false}, {"id", ""}, {"armors_num", 0},
       {"position", {{"x", 0.0}, {"y", 0.0}, {"z", 0.0}}},
@@ -859,17 +1089,37 @@ void FoxgloveServer::publish_rmvision(
     if (!targets.empty()) {
       const auto & t = targets.front();
       const auto x = t.ekf_x();
+      const int armor_num = static_cast<int>(t.armor_xyza_list().size());
+      // 11 维 EKF：x[8]=r1，x[9]=l(r2-r1)，x[10]=dz；4 板目标 r2 = r1 + l
+      const double r1 = x[8];
+      const double r2 = (armor_num >= 4) ? x[8] + x[9] : x[8];
       msg["tracking"] = true;
-      msg["armors_num"] = static_cast<int>(t.armor_xyza_list().size());
+      msg["armors_num"] = armor_num;
       msg["position"] = {{"x", x[0]}, {"y", x[2]}, {"z", x[4]}};
       msg["velocity"] = {{"x", x[1]}, {"y", x[3]}, {"z", x[5]}};
       msg["yaw"] = x[6]; msg["v_yaw"] = x[7]; msg["id"] = auto_aim::ARMOR_NAMES.at(static_cast<size_t>(t.name));
+      msg["radius_1"] = r1; msg["radius_2"] = r2; msg["dz"] = x[10];
     }
     const auto data = msg.dump();
     impl_->rm_target_ch->log(reinterpret_cast<const std::byte *>(data.data()), data.size(), ns);
   }
   if (impl_->rm_info_ch) {
-    nlohmann::json msg = {{"position_diff", 0.0}, {"yaw_diff", 0.0},
+    // 帧间抖动指标：中心位移与 yaw 变化量（跟踪丢失时清零）
+    double position_diff = 0.0, yaw_diff = 0.0;
+    if (!targets.empty()) {
+      const auto x = targets.front().ekf_x();
+      const Eigen::Vector3d center(x[0], x[2], x[4]);
+      if (impl_->has_last_target) {
+        position_diff = (center - impl_->last_center).norm();
+        yaw_diff = tools::limit_rad(x[6] - impl_->last_yaw);
+      }
+      impl_->last_center = center;
+      impl_->last_yaw = x[6];
+      impl_->has_last_target = true;
+    } else {
+      impl_->has_last_target = false;
+    }
+    nlohmann::json msg = {{"header", info_header}, {"position_diff", position_diff}, {"yaw_diff", yaw_diff},
       {"position", {{"x", aim_xyza[0]}, {"y", aim_xyza[1]}, {"z", aim_xyza[2]}}},
       {"yaw", aim_xyza[3]}};
     const auto data = msg.dump();
@@ -1005,7 +1255,9 @@ void FoxgloveServer::publish_tracker_markers(const std::list<auto_aim::Target> &
       cube.action = 0;
       cube.position = xyza_list[i].head<3>();
       cube.orientation =
-        Eigen::Quaterniond(Eigen::AngleAxisd(xyza_list[i][3], Eigen::Vector3d::UnitZ()));
+        Eigen::Quaterniond(
+          Eigen::AngleAxisd(xyza_list[i][3], Eigen::Vector3d::UnitZ()) *
+          Eigen::AngleAxisd(armor_pitch(t.name), Eigen::Vector3d::UnitY()));
       cube.scale = {0.03, width, 0.125};
       cube.color = {1.0f, 0.0f, 0.0f, 1.0f};
       markers.push_back(std::move(cube));
@@ -1020,7 +1272,8 @@ void FoxgloveServer::publish_tracker_markers(const std::list<auto_aim::Target> &
 
 void FoxgloveServer::publish_debug(
   double fps, const io::Command & command, const std::list<auto_aim::Target> & targets,
-  const std::list<auto_aim::Armor> & armors, bool aim_valid, const Eigen::Vector4d & aim_xyza)
+  const std::list<auto_aim::Armor> & armors, bool aim_valid, const Eigen::Vector4d & aim_xyza,
+  const Eigen::Vector3d & gimbal_ypr)
 {
   if (!impl_->debug_ch || !has_clients()) return;
 
@@ -1029,6 +1282,8 @@ void FoxgloveServer::publish_debug(
   dbg["fps"] = fps;
   dbg["yaw"] = command.yaw;
   dbg["pitch"] = command.pitch;
+  dbg["gimbal_yaw"] = gimbal_ypr[0];
+  dbg["gimbal_pitch"] = gimbal_ypr[1];
   dbg["shoot"] = command.shoot ? 1 : 0;
   dbg["armors"] = static_cast<int>(armors.size());
   dbg["targets"] = static_cast<int>(targets.size());

@@ -15,7 +15,7 @@ cd "$DGE" && ./build/standard configs/daedalus.yaml
 # 仿真器窗口按 F5 开启自瞄；IJKL 把敌方假人开进视野
 ```
 
-一键启动：`cd "$SIM" && ./start_simulation.sh`；首次部署：`bash "$SIM/setup_dge_daedalus.sh" "$DGE"`。
+首次部署见《DGE_部署Daedalus仿真指南.md》§4（维护仓库已含仿真后端，克隆即用）。
 
 ## 文档
 
