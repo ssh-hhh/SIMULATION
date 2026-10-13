@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "/home/hhh/桌面/simulation/talos26-master"
+    "cmake.sourceDirectory": "/home/hhh/桌面/simulation/bevy_robomaster_simulator-master/rm_interfaces",
+    "cmake.autoDetectSourceDirectory": false
 }

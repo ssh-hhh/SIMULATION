@@ -1,8 +1,10 @@
 //! 坐标系标定工具
-//! watch 模式: 消费图像保持数据流，打印云台姿态在两种轴变换下的 yaw/pitch
+//! watch 模式: 消费图像保持数据流，打印云台姿态在三种轴变换下的 yaw/pitch
+//!             V0 = 当前配置（imu_left/right=单位四元数，直接用原始四元数）
+//!             V1/V2 = 历史/备用变换，排查轴系问题时对照
 //! send 模式:  发一条云台指令（度），用于标定指令符号
 use std::sync::atomic::{AtomicU8, Ordering};
-use talos_ipc::{PoseIndex, ShmMetaRegion, ShmRegion, IMAGE_POOL_SIZE, SHM_NAME_IMAGE_POOL, SHM_NAME_META};
+use talos_ipc::{PoseIndex, ShmMetaRegion, ShmRegion, SHM_NAME_META};
 
 #[derive(Clone, Copy, Default)]
 struct Quat { w: f64, x: f64, y: f64, z: f64 }
@@ -19,7 +21,7 @@ impl Quat {
     fn yaw_deg(self) -> f64 { 2.0 * self.z.atan2(self.w) * 57.29578 }
     fn pitch_deg(self) -> f64 { 2.0 * self.y.atan2(self.w) * 57.29578 }
 }
-const P: Quat = Quat { w: 0.5, x: 0.5, y: 0.5, z: 0.5 }; // Bevy→DGE 轴变换
+const P: Quat = Quat { w: 0.5, x: 0.5, y: 0.5, z: 0.5 }; // 【历史】早期误用的“再变换一次”（当前配置不用它）
 
 fn main() {
     let mut meta = ShmRegion::open(SHM_NAME_META, std::mem::size_of::<ShmMetaRegion>()).unwrap();
@@ -64,12 +66,14 @@ fn main() {
                     if i == PoseIndex::Gimbal as usize {
                         let q = &pose_buf.slots[ready].quaternion;
                         let q = Quat { w: q[0] as f64, x: q[1] as f64, y: q[2] as f64, z: q[3] as f64 };
-                        let v1 = P.mul(q).mul(P.conj());   // 当前 DGE 适配层用的映射
-                        let v2 = P.conj().mul(q).mul(P);   // 反向候选
+                        let v0 = q;                        // 当前配置（单位变换）：直接用发布值
+                        let v1 = P.mul(q).mul(P.conj());   // 【历史】0.5 轴变换（25°抬头会被当成 yaw）
+                        let v2 = P.conj().mul(q).mul(P);   // 反向候选（备用）
                         println!(
-                            "V1 yaw={:+7.1} pitch={:+6.1} | V2 yaw={:+7.1} pitch={:+6.1} | 原始(w{:.2} x{:.2} y{:.2} z{:.2})",
-                            v1.yaw_deg(), v1.pitch_deg(), v2.yaw_deg(), v2.pitch_deg(),
-                            q.w, q.x, q.y, q.z);
+                            "V0(当前) yaw={:+7.1} pitch={:+6.1} | V1(旧0.5变换) yaw={:+7.1} pitch={:+6.1} | V2(反向) yaw={:+7.1} pitch={:+6.1}",
+                            v0.yaw_deg(), v0.pitch_deg(),
+                            v1.yaw_deg(), v1.pitch_deg(),
+                            v2.yaw_deg(), v2.pitch_deg());
                     }
                 }
             }

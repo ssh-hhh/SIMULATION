@@ -1,7 +1,13 @@
-#include "tools/foxglove.hpp"
+#include "foxglove.hpp"
 
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -10,11 +16,15 @@
 #include <foxglove/context.hpp>
 #include <foxglove/messages.hpp>
 #include <foxglove/websocket.hpp>
+#include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include "tools/logger.hpp"
 
 namespace tools
 {
+using namespace foxglove::messages;
+
 namespace
 {
 uint64_t now_ns()
@@ -25,12 +35,313 @@ uint64_t now_ns()
       .count());
 }
 
-foxglove::messages::Timestamp to_timestamp(uint64_t ns)
+// 纳秒 -> Foxglove 的 sec/nsec 时间戳
+Timestamp to_timestamp(uint64_t ns)
 {
-  foxglove::messages::Timestamp t;
+  Timestamp t;
   t.sec = static_cast<uint32_t>(ns / 1000000000ULL);
   t.nsec = static_cast<uint32_t>(ns % 1000000000ULL);
   return t;
+}
+
+Quaternion make_quaternion(const Eigen::Quaterniond & q)
+{
+  return Quaternion{q.x(), q.y(), q.z(), q.w()};
+}
+
+// 绕 Z 轴 yaw 的位姿（DGE 世界系：x 前、y 左、z 上）
+Pose make_pose(double x, double y, double z, double yaw)
+{
+  Pose pose;
+  pose.position = Vector3{x, y, z};
+  const Eigen::Quaterniond q(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
+  pose.orientation = make_quaternion(q);
+  return pose;
+}
+
+Vector3 make_vector3(double x, double y, double z) { return Vector3{x, y, z}; }
+
+Color make_color(double r, double g, double b, double a = 1.0) { return Color{r, g, b, a}; }
+
+const Color kDetectedRed = make_color(1.0, 0.15, 0.15);
+const Color kDetectedBlue = make_color(0.2, 0.5, 1.0);
+const Color kDetectedOther = make_color(0.6, 0.6, 0.6);
+const Color kTracked = make_color(1.0, 0.85, 0.1);
+const Color kAim = make_color(0.1, 1.0, 0.3);
+
+// 装甲板棋盘尺寸（米），局部 x = 法线（厚度）、y = 宽度、z = 高度
+Vector3 armor_size(auto_aim::ArmorType type)
+{
+  const double width = (type == auto_aim::big) ? 0.230 : 0.135;
+  return make_vector3(0.02, width, 0.125);
+}
+
+Color armor_color(auto_aim::Color color)
+{
+  switch (color) {
+  case auto_aim::red: return kDetectedRed;
+  case auto_aim::blue: return kDetectedBlue;
+  default: return kDetectedOther;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ROS2 CDR (XCDR1, little-endian, 无 encapsulation header) 序列化。
+// 与 ros2_foxglove_bridge 的 "cdr" 编码一致，供 Foxglove Studio 3D 面板
+// 按 visualization_msgs/msg/MarkerArray 渲染。
+// ---------------------------------------------------------------------------
+class CdrWriter
+{
+public:
+  // CDR 流以 4 字节 RTPS encapsulation 头开始（PLAIN_CDR, little-endian）：
+  // 与 @foxglove/cdr / foxglove_bridge 输出一致，否则 Studio 无法解码。
+  CdrWriter()
+  {
+    buf_ = {std::byte{0x00}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}};
+  }
+
+  void u32(uint32_t v) { align(4); append(&v, sizeof v); }
+  void i32(int32_t v) { align(4); append(&v, sizeof v); }
+  void f32(float v) { align(4); append(&v, sizeof v); }
+  void f64(double v) { align(8); append(&v, sizeof v); }
+  void u8(uint8_t v) { buf_.push_back(static_cast<std::byte>(v)); }
+
+  void str(const std::string & s)
+  {
+    align(4);
+    const uint32_t len = static_cast<uint32_t>(s.size()) + 1;  // 含结尾 '\0'
+    append(&len, sizeof len);
+    append(s.data(), s.size());
+    buf_.push_back(std::byte{0});
+  }
+
+  // 序列头：4 字节长度；元素按 element_alignment 对齐（首元素）
+  void seq_begin(uint32_t count, size_t element_alignment)
+  {
+    align(4);
+    append(&count, sizeof count);
+    if (count > 0) align(element_alignment);
+  }
+
+  std::vector<std::byte> & buf() { return buf_; }
+  const std::vector<std::byte> & buf() const { return buf_; }
+
+private:
+  // 对齐基准是 CDR 数据起点（跳过 4 字节封装头），与 @foxglove/cdr 的 origin 一致
+  static constexpr size_t kHeaderSize = 4;
+
+  void align(size_t n)
+  {
+    const size_t rel = buf_.size() - kHeaderSize;
+    const size_t r = rel % n;
+    if (r != 0) buf_.resize(buf_.size() + (n - r), std::byte{0});
+  }
+  void append(const void * p, size_t n)
+  {
+    const auto * b = static_cast<const std::byte *>(p);
+    buf_.insert(buf_.end(), b, b + n);
+  }
+  std::vector<std::byte> buf_;
+};
+
+// visualization_msgs/msg/Marker 的字段子集（按字段顺序）
+struct RosMarker
+{
+  std::string ns;
+  int32_t id = 0;
+  int32_t type = 0;    // ARROW=0 CUBE=1 SPHERE=2 TEXT_VIEW_FACING=9
+  int32_t action = 0;  // ADD/MODIFY=0
+  Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d scale = Eigen::Vector3d::Ones();
+  std::array<float, 4> color = {1.0f, 1.0f, 1.0f, 1.0f};
+  uint32_t lifetime_ns = 0;
+  bool frame_locked = false;
+  std::vector<Eigen::Vector3d> points;
+  std::string text;
+};
+
+// 按 humble 版 Marker.msg 字段顺序序列化单个 Marker
+void write_marker(
+  CdrWriter & w, const RosMarker & m, uint32_t sec, uint32_t nanosec, const std::string & frame_id)
+{
+  // std_msgs/Header
+  w.i32(static_cast<int32_t>(sec));
+  w.u32(nanosec);
+  w.str(frame_id);
+  w.str(m.ns);
+  w.i32(m.id);
+  w.i32(m.type);
+  w.i32(m.action);
+  // geometry_msgs/Pose
+  w.f64(m.position.x());
+  w.f64(m.position.y());
+  w.f64(m.position.z());
+  w.f64(m.orientation.x());
+  w.f64(m.orientation.y());
+  w.f64(m.orientation.z());
+  w.f64(m.orientation.w());
+  // geometry_msgs/Vector3 scale
+  w.f64(m.scale.x());
+  w.f64(m.scale.y());
+  w.f64(m.scale.z());
+  // std_msgs/ColorRGBA
+  for (const float c : m.color) w.f32(c);
+  // builtin_interfaces/Duration lifetime
+  w.i32(0);
+  w.u32(m.lifetime_ns);
+  // bool frame_locked
+  w.u8(m.frame_locked ? 1 : 0);
+  // geometry_msgs/Point[] points
+  w.seq_begin(static_cast<uint32_t>(m.points.size()), 8);
+  for (const auto & p : m.points) {
+    w.f64(p.x());
+    w.f64(p.y());
+    w.f64(p.z());
+  }
+  // std_msgs/ColorRGBA[] colors（空）
+  w.seq_begin(0, 4);
+  // string texture_resource
+  w.str("");
+  // sensor_msgs/CompressedImage texture（空：header + format + data）
+  w.i32(static_cast<int32_t>(sec));
+  w.u32(nanosec);
+  w.str(frame_id);
+  w.str("");
+  w.seq_begin(0, 1);
+  // UVCoordinate[] uv_coordinates（空）
+  w.seq_begin(0, 4);
+  // string text
+  w.str(m.text);
+  // string mesh_resource
+  w.str("");
+  // MeshFile mesh_file（空：filename + data）
+  w.str("");
+  w.seq_begin(0, 1);
+  // bool mesh_use_embedded_materials
+  w.u8(0);
+}
+
+// ros2msg 格式的完整消息定义文本（visualization_msgs/msg/MarkerArray）
+const std::string & marker_array_schema()
+{
+  static const std::string schema = [] {
+    const std::string sep = std::string(80, '=') + "\nMSG: ";
+    std::string s;
+    const auto add = [&](const std::string & name, const std::string & text) {
+      if (s.empty()) { s = text; }
+      else { s += "\n" + sep + name + "\n" + text; }
+    };
+    add("visualization_msgs/msg/MarkerArray", "Marker[] markers\n");
+    add(
+      "visualization_msgs/Marker", R"(
+std_msgs/Header header
+string ns
+int32 id
+int32 type
+int32 action
+geometry_msgs/Pose pose
+geometry_msgs/Vector3 scale
+std_msgs/ColorRGBA color
+builtin_interfaces/Duration lifetime
+bool frame_locked
+geometry_msgs/Point[] points
+std_msgs/ColorRGBA[] colors
+string texture_resource
+sensor_msgs/CompressedImage texture
+UVCoordinate[] uv_coordinates
+string text
+string mesh_resource
+MeshFile mesh_file
+bool mesh_use_embedded_materials
+)");
+    add(
+      "std_msgs/Header", R"(
+builtin_interfaces/Time stamp
+string frame_id
+)");
+    add("std_msgs/ColorRGBA", "float32 r\nfloat32 g\nfloat32 b\nfloat32 a\n");
+    add("geometry_msgs/Pose", "Point position\nQuaternion orientation\n");
+    add("geometry_msgs/Point", "float64 x\nfloat64 y\nfloat64 z\n");
+    add("geometry_msgs/Quaternion", "float64 x 0\nfloat64 y 0\nfloat64 z 0\nfloat64 w 1\n");
+    add("geometry_msgs/Vector3", "float64 x\nfloat64 y\nfloat64 z\n");
+    add("builtin_interfaces/Time", "int32 sec\nuint32 nanosec\n");
+    add("builtin_interfaces/Duration", "int32 sec\nuint32 nanosec\n");
+    add(
+      "sensor_msgs/CompressedImage", R"(
+std_msgs/Header header
+string format
+uint8[] data
+)");
+    add("visualization_msgs/UVCoordinate", "float32 u\nfloat32 v\n");
+    add("visualization_msgs/MeshFile", "string filename\nuint8[] data\n");
+    return s;
+  }();
+  return schema;
+}
+
+// ros2msg 格式：geometry_msgs/msg/PointStamped（/aiming_point）
+const std::string & point_stamped_schema()
+{
+  static const std::string schema = [] {
+    const std::string sep = std::string(80, '=') + "\nMSG: ";
+    std::string s = "std_msgs/Header header\ngeometry_msgs/Point point\n";
+    s += "\n" + sep + "std_msgs/Header" + "\n" + "builtin_interfaces/Time stamp\nstring frame_id\n";
+    s += "\n" + sep + "builtin_interfaces/Time" + "\n" + "int32 sec\nuint32 nanosec\n";
+    s += "\n" + sep + "geometry_msgs/Point" + "\n" + "float64 x\nfloat64 y\nfloat64 z\n";
+    return s;
+  }();
+  return schema;
+}
+
+foxglove::Schema cdr_schema(const std::string & type_name, const std::string & text)
+{
+  return foxglove::Schema{
+    type_name, "ros2msg", reinterpret_cast<const std::byte *>(text.data()), text.size()};
+}
+
+void log_raw(
+  std::optional<foxglove::RawChannel> & ch, const std::vector<std::byte> & data, uint64_t ns)
+{
+  if (ch) ch->log(data.data(), data.size(), ns);
+}
+
+// YAML 标量 -> bool/int64/double/string（yaml-cpp 不解析隐式 tag，需自行判断）
+foxglove::ParameterValue yaml_scalar(const std::string & s)
+{
+  if (s == "true" || s == "True" || s == "TRUE") return foxglove::ParameterValue(true);
+  if (s == "false" || s == "False" || s == "FALSE") return foxglove::ParameterValue(false);
+
+  if (!s.empty()) {
+    char * end = nullptr;
+    errno = 0;
+    const long long i = std::strtoll(s.c_str(), &end, 10);
+    if (end && *end == '\0' && errno == 0) return foxglove::ParameterValue(static_cast<int64_t>(i));
+
+    end = nullptr;
+    errno = 0;
+    const double d = std::strtod(s.c_str(), &end);
+    if (end && *end == '\0' && end != s.c_str() && errno == 0)
+      return foxglove::ParameterValue(d);
+  }
+  return foxglove::ParameterValue(s);
+}
+
+// YAML 配置值 -> Foxglove 参数值（Parameters 面板）
+foxglove::ParameterValue yaml_to_param(const YAML::Node & node)
+{
+  if (node.IsSequence()) {
+    std::vector<foxglove::ParameterValue> arr;
+    for (const auto & e : node) arr.push_back(yaml_to_param(e));
+    return foxglove::ParameterValue(std::move(arr));
+  }
+  if (node.IsMap()) {
+    std::map<std::string, foxglove::ParameterValue> dict;
+    for (const auto & kv : node)
+      dict.emplace(kv.first.as<std::string>(), yaml_to_param(kv.second));
+    return foxglove::ParameterValue(std::move(dict));
+  }
+  return yaml_scalar(node.Scalar());
 }
 }  // namespace
 
@@ -38,10 +349,28 @@ struct FoxgloveServer::Impl
 {
   foxglove::Context context;
   std::optional<foxglove::WebSocketServer> server;
-  std::optional<foxglove::messages::CompressedImageChannel> image_ch;
-  std::optional<foxglove::messages::ImageAnnotationsChannel> annotations_ch;
+  std::optional<CompressedImageChannel> image_ch;
+  std::optional<CompressedImageChannel> result_img_ch;   // /detector/result_img/compressed
+  std::optional<CompressedImageChannel> number_img_ch;   // /detector/number_img
+  std::optional<ImageAnnotationsChannel> annotations_ch;
   std::optional<foxglove::RawChannel> debug_ch;
+  std::optional<CameraCalibrationChannel> camera_info_ch;
+  std::optional<FrameTransformsChannel> tf_ch;
+  std::optional<SceneUpdateChannel> scene_ch;
+  std::optional<foxglove::RawChannel> rm_target_ch;
+  std::optional<foxglove::RawChannel> rm_info_ch;
+  std::optional<foxglove::RawChannel> rm_armors_ch;
+  std::optional<foxglove::RawChannel> detector_marker_ch;  // /detector/marker (cdr MarkerArray)
+  std::optional<foxglove::RawChannel> tracker_marker_ch;   // /tracker/marker (cdr MarkerArray)
+  std::optional<foxglove::RawChannel> aiming_point_ch;     // /aiming_point (cdr PointStamped)
+  std::vector<foxglove::Parameter> parameters;             // Parameters 面板
+
   uint64_t last_image_ns = 0;
+
+  // 相机外参：gimbal_link -> camera_optical_frame
+  Eigen::Vector3d camera_translation = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond camera_rotation = Eigen::Quaterniond::Identity();
+  std::optional<CameraCalibration> camera_calibration;
 };
 
 FoxgloveServer::FoxgloveServer(int port, std::string name) : impl_(std::make_unique<Impl>())
@@ -53,6 +382,38 @@ FoxgloveServer::FoxgloveServer(int port, std::string name) : impl_(std::make_uni
   opts.name = std::move(name);
   opts.host = "0.0.0.0";
   opts.port = static_cast<uint16_t>(port);
+  opts.capabilities = foxglove::WebSocketServerCapabilities::Parameters;
+  opts.supported_encodings = {"cdr", "json", "protobuf"};
+
+  // Parameters 面板：返回 yaml 里的参数；客户端修改时同步镜像
+  opts.callbacks.onGetParameters =
+    [this](
+      uint32_t, std::optional<std::string_view>,
+      const std::vector<std::string_view> & names) -> std::vector<foxglove::Parameter> {
+    std::vector<foxglove::Parameter> out;
+    for (const auto & p : impl_->parameters) out.push_back(p.clone());
+    return out;
+  };
+  opts.callbacks.onSetParameters =
+    [this](
+      uint32_t, std::optional<std::string_view>,
+      const std::vector<foxglove::ParameterView> & params) -> std::vector<foxglove::Parameter> {
+    for (const auto & view : params) {
+      auto updated = view.clone();
+      bool found = false;
+      for (auto & stored : impl_->parameters) {
+        if (stored.name() == updated.name()) {
+          stored = std::move(updated);
+          found = true;
+          break;
+        }
+      }
+      if (!found) impl_->parameters.push_back(std::move(updated));
+    }
+    std::vector<foxglove::Parameter> out;
+    for (const auto & p : impl_->parameters) out.push_back(p.clone());
+    return out;
+  };
 
   auto server = foxglove::WebSocketServer::create(std::move(opts));
   if (!server) {
@@ -61,16 +422,27 @@ FoxgloveServer::FoxgloveServer(int port, std::string name) : impl_(std::make_uni
   }
   impl_->server = std::move(*server);
 
-  if (auto ch = foxglove::messages::CompressedImageChannel::create("/camera/image", impl_->context);
-      ch) {
+  if (auto ch = CompressedImageChannel::create("/camera/image", impl_->context); ch) {
     impl_->image_ch = std::move(*ch);
   } else {
     logger()->error("foxglove: create /camera/image: {}", foxglove::strerror(ch.error()));
   }
 
-  if (auto ch = foxglove::messages::ImageAnnotationsChannel::create(
-        "/camera/annotations", impl_->context);
+  if (auto ch = CompressedImageChannel::create("/detector/result_img/compressed", impl_->context);
       ch) {
+    impl_->result_img_ch = std::move(*ch);
+  } else {
+    logger()->error(
+      "foxglove: create /detector/result_img/compressed: {}", foxglove::strerror(ch.error()));
+  }
+
+  if (auto ch = CompressedImageChannel::create("/detector/number_img", impl_->context); ch) {
+    impl_->number_img_ch = std::move(*ch);
+  } else {
+    logger()->error("foxglove: create /detector/number_img: {}", foxglove::strerror(ch.error()));
+  }
+
+  if (auto ch = ImageAnnotationsChannel::create("/camera/annotations", impl_->context); ch) {
     impl_->annotations_ch = std::move(*ch);
   } else {
     logger()->error("foxglove: create /camera/annotations: {}", foxglove::strerror(ch.error()));
@@ -82,6 +454,57 @@ FoxgloveServer::FoxgloveServer(int port, std::string name) : impl_(std::make_uni
   } else {
     logger()->error("foxglove: create /dge/debug: {}", foxglove::strerror(ch.error()));
   }
+
+  if (auto ch = CameraCalibrationChannel::create("/camera_info", impl_->context); ch) {
+    impl_->camera_info_ch = std::move(*ch);
+  } else {
+    logger()->error("foxglove: create /camera_info: {}", foxglove::strerror(ch.error()));
+  }
+
+  if (auto ch = FrameTransformsChannel::create("/tf", impl_->context); ch) {
+    impl_->tf_ch = std::move(*ch);
+  } else {
+    logger()->error("foxglove: create /tf: {}", foxglove::strerror(ch.error()));
+  }
+
+  if (auto ch = SceneUpdateChannel::create("/dge/scene", impl_->context); ch) {
+    impl_->scene_ch = std::move(*ch);
+  } else {
+    logger()->error("foxglove: create /dge/scene: {}", foxglove::strerror(ch.error()));
+  }
+
+  const std::string & object_schema_text = []() -> const std::string & {
+    static const std::string s = R"({"type":"object"})";
+    return s;
+  }();
+  const auto json_schema = [&object_schema_text](const char * name) {
+    return foxglove::Schema{
+      name, "jsonschema", reinterpret_cast<const std::byte *>(object_schema_text.data()),
+      object_schema_text.size()};
+  };
+  if (auto ch = foxglove::RawChannel::create(
+        "/tracker/target", "json", json_schema("auto_aim_interfaces/msg/Target"),
+        impl_->context); ch) impl_->rm_target_ch = std::move(*ch);
+  if (auto ch = foxglove::RawChannel::create(
+        "/tracker/info", "json", json_schema("auto_aim_interfaces/msg/TrackerInfo"),
+        impl_->context); ch) impl_->rm_info_ch = std::move(*ch);
+  if (auto ch = foxglove::RawChannel::create(
+        "/detector/armors", "json", json_schema("auto_aim_interfaces/msg/Armors"),
+        impl_->context); ch) impl_->rm_armors_ch = std::move(*ch);
+
+  // 3D 面板 Marker 话题：cdr 编码 + ros2msg schema（与 ros2_foxglove_bridge 相同）
+  const auto & ma_text = marker_array_schema();
+  if (auto ch = foxglove::RawChannel::create(
+        "/detector/marker", "cdr", cdr_schema("visualization_msgs/msg/MarkerArray", ma_text),
+        impl_->context); ch) impl_->detector_marker_ch = std::move(*ch);
+  if (auto ch = foxglove::RawChannel::create(
+        "/tracker/marker", "cdr", cdr_schema("visualization_msgs/msg/MarkerArray", ma_text),
+        impl_->context); ch) impl_->tracker_marker_ch = std::move(*ch);
+
+  const auto & ps_text = point_stamped_schema();
+  if (auto ch = foxglove::RawChannel::create(
+        "/aiming_point", "cdr", cdr_schema("geometry_msgs/msg/PointStamped", ps_text),
+        impl_->context); ch) impl_->aiming_point_ch = std::move(*ch);
 
   logger()->info("foxglove: WebSocket server on ws://0.0.0.0:{}", port);
 }
@@ -96,26 +519,276 @@ bool FoxgloveServer::has_clients() const
   return impl_ && impl_->server && impl_->server->clientCount() > 0;
 }
 
+void FoxgloveServer::configure_camera(const std::string & config_path)
+{
+  auto yaml = YAML::LoadFile(config_path);
+
+  // Parameters 面板：把 yaml 顶层参数（含嵌套）暴露给 Foxglove
+  impl_->parameters.clear();
+  if (yaml.IsMap()) {
+    for (const auto & kv : yaml) {
+      const std::string key = kv.first.as<std::string>();
+      auto value = yaml_to_param(kv.second);
+      if (value.is<std::string>() || value.is<double>() || value.is<int64_t>() ||
+          value.is<bool>()) {
+        if (value.is<std::string>())
+          impl_->parameters.emplace_back(key, value.get<std::string>());
+        else if (value.is<double>())
+          impl_->parameters.emplace_back(key, value.get<double>());
+        else if (value.is<int64_t>())
+          impl_->parameters.emplace_back(key, value.get<int64_t>());
+        else
+          impl_->parameters.emplace_back(key, value.get<bool>());
+      } else {
+        impl_->parameters.emplace_back(
+          key, foxglove::ParameterType::None, std::move(value));
+      }
+    }
+  }
+
+  if (!impl_->camera_info_ch) return;
+
+  const auto camera_matrix = yaml["camera_matrix"].as<std::vector<double>>();
+  const auto distort = yaml["distort_coeffs"].as<std::vector<double>>();
+  const auto r_camera2gimbal = yaml["R_camera2gimbal"].as<std::vector<double>>();
+  const auto t_camera2gimbal = yaml["t_camera2gimbal"].as<std::vector<double>>();
+
+  const double fx = camera_matrix[0];
+  const double fy = camera_matrix[4];
+  const double cx = camera_matrix[2];
+  const double cy = camera_matrix[5];
+
+  // 外参：camera_optical_frame 在 gimbal_link 下的位姿
+  impl_->camera_rotation = Eigen::Quaterniond(
+    Eigen::Matrix3d(
+      Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(r_camera2gimbal.data())));
+  impl_->camera_translation = Eigen::Vector3d(
+    t_camera2gimbal[0], t_camera2gimbal[1], t_camera2gimbal[2]);
+
+  const uint64_t ns = now_ns();
+  CameraCalibration calib;
+  calib.timestamp = to_timestamp(ns);
+  calib.frame_id = "camera_optical_frame";
+  calib.width = 1440;
+  calib.height = 1080;
+  calib.distortion_model = "plumb_bob";
+  calib.d = distort;
+  calib.k = {fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0};
+  calib.r = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+  calib.p = {fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0};
+  impl_->camera_calibration = calib;
+  impl_->camera_info_ch->log(calib, ns);
+
+  logger()->info(
+    "foxglove: camera fx={:.2f} fy={:.2f} cx={:.2f} cy={:.2f}, extrinsics t=({:.3f},{:.3f},{:.3f})",
+    fx, fy, cx, cy, impl_->camera_translation.x(), impl_->camera_translation.y(),
+    impl_->camera_translation.z());
+}
+
+void FoxgloveServer::publish_tf(const Eigen::Quaterniond & gimbal_world_q)
+{
+  if (!impl_->tf_ch || !has_clients()) return;
+
+  const uint64_t ns = now_ns();
+  // 客户端通常晚于进程启动连接，随 TF 重发内参，避免错过一次性消息。
+  if (impl_->camera_info_ch && impl_->camera_calibration) {
+    auto calib = *impl_->camera_calibration;
+    calib.timestamp = to_timestamp(ns);
+    impl_->camera_info_ch->log(calib, ns);
+  }
+  FrameTransforms msg;
+
+  {
+    FrameTransform tf;
+    tf.timestamp = to_timestamp(ns);
+    tf.parent_frame_id = "odom";
+    tf.child_frame_id = "gimbal_link";
+    tf.translation = make_vector3(0.0, 0.0, 0.0);
+    tf.rotation = make_quaternion(gimbal_world_q);
+    msg.transforms.push_back(tf);
+  }
+  {
+    FrameTransform tf;
+    tf.timestamp = to_timestamp(ns);
+    tf.parent_frame_id = "gimbal_link";
+    tf.child_frame_id = "camera_optical_frame";
+    tf.translation = make_vector3(
+      impl_->camera_translation.x(), impl_->camera_translation.y(),
+      impl_->camera_translation.z());
+    tf.rotation = make_quaternion(impl_->camera_rotation);
+    msg.transforms.push_back(tf);
+  }
+
+  impl_->tf_ch->log(msg, ns);
+}
+
+void FoxgloveServer::publish_scene(
+  const std::list<auto_aim::Armor> & armors, const std::list<auto_aim::Target> & targets,
+  bool aim_valid, const Eigen::Vector4d & aim_xyza)
+{
+  if (!impl_->scene_ch || !has_clients()) return;
+
+  const uint64_t ns = now_ns();
+  SceneUpdate update;
+
+  // 检测到的装甲板
+  {
+    SceneEntity entity;
+    entity.timestamp = to_timestamp(ns);
+    entity.frame_id = "odom";
+    entity.id = "detections";
+    entity.frame_locked = false;
+
+    for (const auto & armor : armors) {
+      CubePrimitive cube;
+      cube.pose = make_pose(
+        armor.xyz_in_world.x(), armor.xyz_in_world.y(), armor.xyz_in_world.z(),
+        armor.ypr_in_world[0]);
+      cube.size = armor_size(armor.type);
+      cube.color = armor_color(armor.color);
+      entity.cubes.push_back(cube);
+    }
+    update.entities.push_back(std::move(entity));
+  }
+
+  // 跟踪目标：预测的各装甲板 + 中心
+  {
+    SceneEntity entity;
+    entity.timestamp = to_timestamp(ns);
+    entity.frame_id = "odom";
+    entity.id = "tracked_target";
+    entity.frame_locked = false;
+
+    if (!targets.empty()) {
+      const auto & target = targets.front();
+      const auto xyza_list = target.armor_xyza_list();
+
+      double cx = 0.0, cy = 0.0, cz = 0.0;
+      for (const auto & xyza : xyza_list) {
+        CubePrimitive cube;
+        cube.pose = make_pose(xyza[0], xyza[1], xyza[2], xyza[3]);
+        cube.size = armor_size(target.armor_type);
+        cube.color = make_color(kTracked.r, kTracked.g, kTracked.b, 0.45);
+        entity.cubes.push_back(cube);
+
+        cx += xyza[0];
+        cy += xyza[1];
+        cz += xyza[2];
+      }
+
+      if (!xyza_list.empty()) {
+        const double n = static_cast<double>(xyza_list.size());
+        cx /= n;
+        cy /= n;
+        cz /= n;
+
+        SpherePrimitive center;
+        center.pose = make_pose(cx, cy, cz, 0.0);
+        center.size = make_vector3(0.12, 0.12, 0.12);
+        center.color = make_color(kTracked.r, kTracked.g, kTracked.b, 0.6);
+        entity.spheres.push_back(center);
+      }
+    }
+    update.entities.push_back(std::move(entity));
+  }
+
+  // 瞄准点 + 指向线
+  {
+    SceneEntity entity;
+    entity.timestamp = to_timestamp(ns);
+    entity.frame_id = "odom";
+    entity.id = "aiming_point";
+    entity.frame_locked = false;
+
+    if (aim_valid) {
+      SpherePrimitive point;
+      point.pose = make_pose(aim_xyza[0], aim_xyza[1], aim_xyza[2], aim_xyza[3]);
+      point.size = make_vector3(0.06, 0.06, 0.06);
+      point.color = kAim;
+      entity.spheres.push_back(point);
+
+      LinePrimitive line;
+      line.type = LinePrimitive::LineType::LINE_STRIP;
+      line.thickness = 0.01;
+      line.color = make_color(kAim.r, kAim.g, kAim.b, 0.5);
+      Point3 origin;
+      origin.x = 0.0;
+      origin.y = 0.0;
+      origin.z = 0.0;
+      Point3 tip;
+      tip.x = aim_xyza[0];
+      tip.y = aim_xyza[1];
+      tip.z = aim_xyza[2];
+      line.points.push_back(origin);
+      line.points.push_back(tip);
+      entity.lines.push_back(line);
+    }
+    update.entities.push_back(std::move(entity));
+  }
+
+  impl_->scene_ch->log(update, ns);
+}
+
 void FoxgloveServer::publish_image(const cv::Mat & bgr, int quality)
 {
   if (bgr.empty() || !impl_->image_ch) return;
   if (!has_clients()) return;
 
+  // 限频约 15fps，避免占满带宽
   const uint64_t ns = now_ns();
-  if (ns - impl_->last_image_ns < 66000000ULL) return;  // 限频约 15fps
+  if (ns - impl_->last_image_ns < 66000000ULL) return;
   impl_->last_image_ns = ns;
 
   std::vector<uint8_t> buf;
   std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, quality};
   cv::imencode(".jpg", bgr, buf, params);
 
-  foxglove::messages::CompressedImage msg;
+  CompressedImage msg;
   msg.timestamp = to_timestamp(ns);
-  msg.frame_id = "camera";
+  msg.frame_id = "camera_optical_frame";
   msg.format = "jpeg";
   msg.data.resize(buf.size());
   std::memcpy(msg.data.data(), buf.data(), buf.size());
   impl_->image_ch->log(msg, ns);
+  // 原布局主视图：/detector/result_img/compressed（同一份 JPEG）
+  if (impl_->result_img_ch) impl_->result_img_ch->log(msg, ns);
+}
+
+void FoxgloveServer::publish_number_image(const std::list<auto_aim::Armor> & armors)
+{
+  if (!impl_->number_img_ch || !has_clients()) return;
+
+  const uint64_t ns = now_ns();
+  // 数字图案拼接图很小（每帧 <2KB），无需限频
+
+  // 把各装甲板的数字图案拼成一排；没有图案时放占位图
+  cv::Mat mosaic;
+  int count = 0;
+  for (const auto & a : armors) {
+    if (a.pattern.empty() || count >= 8) continue;
+    cv::Mat p;
+    cv::resize(a.pattern, p, cv::Size(80, 40));
+    if (mosaic.empty()) mosaic = p;
+    else {
+      cv::Mat tmp;
+      cv::hconcat(mosaic, p, tmp);
+      mosaic = tmp;
+    }
+    ++count;
+  }
+  if (mosaic.empty()) mosaic = cv::Mat::zeros(40, 80, CV_8UC3);
+
+  std::vector<uint8_t> buf;
+  std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, 80};
+  cv::imencode(".jpg", mosaic, buf, params);
+
+  CompressedImage msg;
+  msg.timestamp = to_timestamp(ns);
+  msg.frame_id = "camera_optical_frame";
+  msg.format = "jpeg";
+  msg.data.resize(buf.size());
+  std::memcpy(msg.data.data(), buf.data(), buf.size());
+  impl_->number_img_ch->log(msg, ns);
 }
 
 void FoxgloveServer::publish_annotations(const std::list<auto_aim::Armor> & armors)
@@ -123,22 +796,22 @@ void FoxgloveServer::publish_annotations(const std::list<auto_aim::Armor> & armo
   if (!impl_->annotations_ch || !has_clients()) return;
 
   const uint64_t ns = now_ns();
-  foxglove::messages::ImageAnnotations ann;
+  ImageAnnotations ann;
   ann.timestamp = to_timestamp(ns);
 
   for (const auto & a : armors) {
     if (a.points.size() < 4) continue;
 
-    foxglove::messages::PointsAnnotation pa;
+    PointsAnnotation pa;
     pa.timestamp = to_timestamp(ns);
-    pa.type = foxglove::messages::PointsAnnotation::PointsAnnotationType::LINE_LOOP;
+    pa.type = PointsAnnotation::PointsAnnotationType::LINE_LOOP;
     pa.points.reserve(4);
     for (int i = 0; i < 4; ++i)
-      pa.points.push_back(
-        foxglove::messages::Point2{static_cast<double>(a.points[i].x),
-                                   static_cast<double>(a.points[i].y)});
+      pa.points.push_back(Point2{
+        static_cast<double>(a.points[i].x), static_cast<double>(a.points[i].y)});
 
-    foxglove::messages::Color color;
+    // 按敌方颜色上色：蓝方蓝框、红方红框、其它绿框
+    Color color;
     if (a.color == auto_aim::blue) {
       color = {0.0, 0.4, 1.0, 1.0};
     } else if (a.color == auto_aim::red) {
@@ -147,7 +820,7 @@ void FoxgloveServer::publish_annotations(const std::list<auto_aim::Armor> & armo
       color = {0.0, 1.0, 0.0, 1.0};
     }
     pa.outline_color = color;
-    pa.fill_color = foxglove::messages::Color{color.r, color.g, color.b, 0.0};
+    pa.fill_color = Color{color.r, color.g, color.b, 0.0};
     pa.thickness = 2.0;
     ann.points.push_back(std::move(pa));
   }
@@ -155,12 +828,223 @@ void FoxgloveServer::publish_annotations(const std::list<auto_aim::Armor> & armo
   impl_->annotations_ch->log(ann, ns);
 }
 
-void FoxgloveServer::publish_debug(const nlohmann::json & data)
+void FoxgloveServer::publish_rmvision(
+  const std::list<auto_aim::Armor> & armors, const std::list<auto_aim::Target> & targets,
+  const Eigen::Vector4d & aim_xyza)
+{
+  if (!has_clients()) return;
+  const uint64_t ns = now_ns();
+  nlohmann::json header = {{"stamp", {{"sec", ns / 1000000000ULL}, {"nanosec", ns % 1000000000ULL}}},
+                           {"frame_id", "camera_optical_frame"}};
+  if (impl_->rm_armors_ch) {
+    nlohmann::json msg = {{"header", header}, {"armors", nlohmann::json::array()}};
+    for (const auto & a : armors) {
+      nlohmann::json item;
+      item["number"] = auto_aim::ARMOR_NAMES.at(static_cast<size_t>(a.name));
+      item["type"] = auto_aim::ARMOR_TYPES.at(static_cast<size_t>(a.type));
+      item["distance_to_image_center"] = static_cast<float>(
+        std::hypot(a.center.x - 720.0, a.center.y - 540.0));
+      item["pose"] = {{"position", {{"x", a.xyz_in_gimbal.x()}, {"y", a.xyz_in_gimbal.y()}, {"z", a.xyz_in_gimbal.z()}}},
+                      {"orientation", {{"x", 0.0}, {"y", 0.0}, {"z", 0.0}, {"w", 1.0}}}};
+      msg["armors"].push_back(std::move(item));
+    }
+    const auto data = msg.dump();
+    impl_->rm_armors_ch->log(reinterpret_cast<const std::byte *>(data.data()), data.size(), ns);
+  }
+  if (impl_->rm_target_ch) {
+    nlohmann::json msg = {{"header", header}, {"tracking", false}, {"id", ""}, {"armors_num", 0},
+      {"position", {{"x", 0.0}, {"y", 0.0}, {"z", 0.0}}},
+      {"velocity", {{"x", 0.0}, {"y", 0.0}, {"z", 0.0}}}, {"yaw", 0.0}, {"v_yaw", 0.0},
+      {"radius_1", 0.0}, {"radius_2", 0.0}, {"dz", 0.0}};
+    if (!targets.empty()) {
+      const auto & t = targets.front();
+      const auto x = t.ekf_x();
+      msg["tracking"] = true;
+      msg["armors_num"] = static_cast<int>(t.armor_xyza_list().size());
+      msg["position"] = {{"x", x[0]}, {"y", x[2]}, {"z", x[4]}};
+      msg["velocity"] = {{"x", x[1]}, {"y", x[3]}, {"z", x[5]}};
+      msg["yaw"] = x[6]; msg["v_yaw"] = x[7]; msg["id"] = auto_aim::ARMOR_NAMES.at(static_cast<size_t>(t.name));
+    }
+    const auto data = msg.dump();
+    impl_->rm_target_ch->log(reinterpret_cast<const std::byte *>(data.data()), data.size(), ns);
+  }
+  if (impl_->rm_info_ch) {
+    nlohmann::json msg = {{"position_diff", 0.0}, {"yaw_diff", 0.0},
+      {"position", {{"x", aim_xyza[0]}, {"y", aim_xyza[1]}, {"z", aim_xyza[2]}}},
+      {"yaw", aim_xyza[3]}};
+    const auto data = msg.dump();
+    impl_->rm_info_ch->log(reinterpret_cast<const std::byte *>(data.data()), data.size(), ns);
+  }
+
+  // /aiming_point：geometry_msgs/msg/PointStamped（odom 系瞄准点，原布局 3D 面板）
+  if (impl_->aiming_point_ch) {
+    CdrWriter w;
+    w.i32(static_cast<int32_t>(ns / 1000000000ULL));
+    w.u32(static_cast<uint32_t>(ns % 1000000000ULL));
+    w.str("odom");
+    w.f64(aim_xyza[0]);
+    w.f64(aim_xyza[1]);
+    w.f64(aim_xyza[2]);
+    log_raw(impl_->aiming_point_ch, w.buf(), ns);
+  }
+}
+
+// 绕 Z 轴 yaw 的四元数（odom 系里装甲板/目标的朝向）
+Quaternion yaw_quaternion(double yaw)
+{
+  return make_quaternion(Eigen::Quaterniond(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ())));
+}
+
+void FoxgloveServer::publish_detector_markers(const std::list<auto_aim::Armor> & armors)
+{
+  if (!impl_->detector_marker_ch || !has_clients()) return;
+
+  const uint64_t ns = now_ns();
+  const uint32_t sec = static_cast<uint32_t>(ns / 1000000000ULL);
+  const uint32_t nsec = static_cast<uint32_t>(ns % 1000000000ULL);
+
+  // 对齐 rm_auto_aim：每个装甲板一个 CUBE + 一个 TEXT_VIEW_FACING
+  std::vector<RosMarker> markers;
+  int id = 0;
+  for (const auto & a : armors) {
+    const double width = (a.type == auto_aim::big) ? 0.230 : 0.135;
+    const auto pos = a.xyz_in_world;
+    const double yaw = a.ypr_in_world[0];
+
+    RosMarker cube;
+    cube.ns = "armors";
+    cube.id = ++id;
+    cube.type = 1;  // CUBE
+    cube.action = 0;
+    cube.position = pos;
+    cube.orientation = Eigen::Quaterniond(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
+    cube.scale = {0.05, width, 0.125};
+    cube.color = {0.0f, 0.5f, 1.0f, 1.0f};
+    cube.lifetime_ns = 100000000;  // 0.1s
+    markers.push_back(std::move(cube));
+
+    RosMarker text;
+    text.ns = "classification";
+    text.id = id;
+    text.type = 9;  // TEXT_VIEW_FACING
+    text.action = 0;
+    text.position = pos + Eigen::Vector3d(0.0, -0.1, 0.0);
+    text.scale = {0.0, 0.0, 0.1};
+    text.color = {1.0f, 1.0f, 1.0f, 1.0f};
+    text.lifetime_ns = 100000000;
+    text.text = auto_aim::ARMOR_NAMES.at(static_cast<size_t>(a.name));
+    markers.push_back(std::move(text));
+  }
+
+  CdrWriter w;
+  w.seq_begin(static_cast<uint32_t>(markers.size()), 4);
+  for (const auto & m : markers) write_marker(w, m, sec, nsec, "odom");
+  log_raw(impl_->detector_marker_ch, w.buf(), ns);
+}
+
+void FoxgloveServer::publish_tracker_markers(const std::list<auto_aim::Target> & targets)
+{
+  if (!impl_->tracker_marker_ch || !has_clients()) return;
+
+  const uint64_t ns = now_ns();
+  const uint32_t sec = static_cast<uint32_t>(ns / 1000000000ULL);
+  const uint32_t nsec = static_cast<uint32_t>(ns % 1000000000ULL);
+
+  // 对齐 rm_auto_aim：SPHERE 位置 + 线速度/角速度 ARROW + 各装甲板 CUBE
+  std::vector<RosMarker> markers;
+  if (!targets.empty()) {
+    const auto & t = targets.front();
+    const auto x = t.ekf_x();
+    const double xc = x[0], yc = x[2], za = x[4];
+    const double vx = x[1], vy = x[3], vz = x[5];
+    const double v_yaw = x[7];
+    const double dz = x[10];
+    const Eigen::Vector3d center(xc, yc, za + dz / 2.0);
+
+    {
+      RosMarker position;
+      position.ns = "position";
+      position.id = 0;
+      position.type = 2;  // SPHERE
+      position.action = 0;
+      position.position = center;
+      position.scale = {0.1, 0.1, 0.1};
+      position.color = {0.0f, 1.0f, 0.0f, 1.0f};
+      markers.push_back(std::move(position));
+    }
+    {
+      RosMarker arrow;
+      arrow.ns = "linear_v";
+      arrow.id = 0;
+      arrow.type = 0;  // ARROW
+      arrow.action = 0;
+      arrow.scale = {0.03, 0.05, 0.1};
+      arrow.color = {1.0f, 1.0f, 0.0f, 1.0f};
+      arrow.points = {center, center + Eigen::Vector3d(vx, vy, vz)};
+      markers.push_back(std::move(arrow));
+    }
+    {
+      RosMarker arrow;
+      arrow.ns = "angular_v";
+      arrow.id = 0;
+      arrow.type = 0;  // ARROW
+      arrow.action = 0;
+      arrow.scale = {0.03, 0.05, 0.1};
+      arrow.color = {0.0f, 1.0f, 1.0f, 1.0f};
+      arrow.points = {center, center + Eigen::Vector3d(0.0, 0.0, v_yaw / M_PI)};
+      markers.push_back(std::move(arrow));
+    }
+
+    const double width = (t.armor_type == auto_aim::big) ? 0.230 : 0.135;
+    const auto xyza_list = t.armor_xyza_list();
+    for (size_t i = 0; i < xyza_list.size(); ++i) {
+      RosMarker cube;
+      cube.ns = "armors";
+      cube.id = static_cast<int32_t>(i);
+      cube.type = 1;  // CUBE
+      cube.action = 0;
+      cube.position = xyza_list[i].head<3>();
+      cube.orientation =
+        Eigen::Quaterniond(Eigen::AngleAxisd(xyza_list[i][3], Eigen::Vector3d::UnitZ()));
+      cube.scale = {0.03, width, 0.125};
+      cube.color = {1.0f, 0.0f, 0.0f, 1.0f};
+      markers.push_back(std::move(cube));
+    }
+  }
+
+  CdrWriter w;
+  w.seq_begin(static_cast<uint32_t>(markers.size()), 4);
+  for (const auto & m : markers) write_marker(w, m, sec, nsec, "odom");
+  log_raw(impl_->tracker_marker_ch, w.buf(), ns);
+}
+
+void FoxgloveServer::publish_debug(
+  double fps, const io::Command & command, const std::list<auto_aim::Target> & targets,
+  const std::list<auto_aim::Armor> & armors, bool aim_valid, const Eigen::Vector4d & aim_xyza)
 {
   if (!impl_->debug_ch || !has_clients()) return;
 
-  const std::string s = data.dump();
-  impl_->debug_ch->log(reinterpret_cast<const std::byte *>(s.data()), s.size(), now_ns());
+  // 曲线字段，Plot 面板可直接选
+  nlohmann::json dbg;
+  dbg["fps"] = fps;
+  dbg["yaw"] = command.yaw;
+  dbg["pitch"] = command.pitch;
+  dbg["shoot"] = command.shoot ? 1 : 0;
+  dbg["armors"] = static_cast<int>(armors.size());
+  dbg["targets"] = static_cast<int>(targets.size());
+  if (!targets.empty()) {
+    auto x = targets.front().ekf_x();
+    dbg["ekf"] = std::vector<double>(x.data(), x.data() + x.size());
+  }
+  if (aim_valid) {
+    dbg["aim_x"] = aim_xyza[0];
+    dbg["aim_y"] = aim_xyza[1];
+    dbg["aim_z"] = aim_xyza[2];
+    dbg["aim_yaw"] = aim_xyza[3];
+  }
+
+  const std::string data = dbg.dump();
+  impl_->debug_ch->log(reinterpret_cast<const std::byte *>(data.data()), data.size(), now_ns());
 }
 
 }  // namespace tools

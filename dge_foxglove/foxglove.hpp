@@ -5,39 +5,53 @@
 #include <memory>
 #include <string>
 
-#include <nlohmann/json.hpp>
+#include <Eigen/Dense>
 #include <opencv2/opencv.hpp>
 
+#include "io/command.hpp"
 #include "tasks/auto_aim/armor.hpp"
+#include "tasks/auto_aim/target.hpp"
 
 namespace tools
 {
-
-// DGE 的 Foxglove 可视化桥（基于官方 Foxglove C++ SDK，非手写协议）。
-//
-// 连接方式：Foxglove Studio -> Open connection -> Foxglove WebSocket -> ws://<本机IP>:8765
-//
-// 通道：
-//   /camera/image       foxglove.CompressedImage   (JPEG 图像)
-//   /camera/annotations foxglove.ImageAnnotations  (装甲板识别框)
-//   /dge/debug          json                        (fps/yaw/pitch/shoot/EKF...，Plot 面板画曲线)
-//
-// 实现细节全部藏在 .cpp 里（pimpl），使用方无需包含 SDK 头文件。
+// 把图像、识别框、调试曲线、TF 与 3D 场景推给 Foxglove Studio 的工具。
+// 连接方式：Foxglove Studio -> Foxglove WebSocket -> ws://<本机IP>:8765。
+// 底层是 io/foxglove 下的官方 C++ SDK，SDK 细节不暴露给调用方。
 class FoxgloveServer
 {
 public:
   explicit FoxgloveServer(int port = 8765, std::string name = "DGE_vision_26");
   ~FoxgloveServer();
 
-  FoxgloveServer(const FoxgloveServer &) = delete;
-  FoxgloveServer & operator=(const FoxgloveServer &) = delete;
+  bool has_clients() const;  // 无客户端时可跳过图像编码
 
-  // 是否有客户端连接（无客户端时可跳过高开销的图像编码）
-  bool has_clients() const;
+  void publish_image(const cv::Mat & bgr, int quality = 70);            // /camera/image + /detector/result_img/compressed
+  void publish_annotations(const std::list<auto_aim::Armor> & armors);  // /camera/annotations
+  // 数字分类图案拼接图（/detector/number_img，原布局第二个 ImageViewPanel）
+  void publish_number_image(const std::list<auto_aim::Armor> & armors);
 
-  void publish_image(const cv::Mat & bgr, int quality = 70);
-  void publish_annotations(const std::list<auto_aim::Armor> & armors);
-  void publish_debug(const nlohmann::json & data);
+  // rm_auto_aim-compatible topics used by the supplied Foxglove layouts.
+  void publish_rmvision(
+    const std::list<auto_aim::Armor> & armors, const std::list<auto_aim::Target> & targets,
+    const Eigen::Vector4d & aim_xyza);
+
+  // 3D 面板 Marker 话题（CDR 编码 visualization_msgs/msg/MarkerArray）
+  void publish_detector_markers(const std::list<auto_aim::Armor> & armors);   // /detector/marker
+  void publish_tracker_markers(const std::list<auto_aim::Target> & targets);  // /tracker/marker
+  void publish_debug(                                                   // /dge/debug
+    double fps, const io::Command & command, const std::list<auto_aim::Target> & targets,
+    const std::list<auto_aim::Armor> & armors, bool aim_valid, const Eigen::Vector4d & aim_xyza);
+
+  // 一次性：读取配置里的相机内参/外参，并发布 /camera_info
+  void configure_camera(const std::string & config_path);
+
+  // 每个图像帧：发布 /tf（odom -> gimbal_link -> camera_optical_frame）
+  void publish_tf(const Eigen::Quaterniond & gimbal_world_q);
+
+  // 每个图像帧：发布 /dge/scene（检测装甲板 / 跟踪目标 / 瞄准点的 3D 实体）
+  void publish_scene(
+    const std::list<auto_aim::Armor> & armors, const std::list<auto_aim::Target> & targets,
+    bool aim_valid, const Eigen::Vector4d & aim_xyza);
 
 private:
   struct Impl;
