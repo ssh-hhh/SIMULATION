@@ -26,6 +26,7 @@ use crate::robomaster::tech_core::construct::setup_tech_core;
 use crate::setup::{
     ScanOutpost, setup_collision, setup_dart_launch, setup_outposts, setup_vehicle,
 };
+use crate::systems::setup_armor_perturbation;
 use crate::util::async_world::{AsyncWorld, AsyncWorldTask, drive_async_world};
 
 /// Resolves once Avian has built every collider `setup_collision` queued under `root`.
@@ -198,6 +199,7 @@ async fn load_scene(w: AsyncWorld) {
         )
         .await;
     w.run(setup_vehicle, slapper).await;
+    w.run(setup_armor_perturbation, slapper).await;
 
     let hero = w
         .spawn(
@@ -211,6 +213,7 @@ async fn load_scene(w: AsyncWorld) {
         )
         .await;
     w.run(setup_vehicle, hero).await;
+    w.run(setup_armor_perturbation, hero).await;
 
     info!("scene loaded");
 }

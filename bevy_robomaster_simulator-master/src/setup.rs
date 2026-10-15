@@ -178,6 +178,23 @@ pub fn setup_vehicle(
         commands.entity(e).insert(vehicle_armor_collision_layers);
     });
 
+    // 车体"挡弹体"BODY_SHIELD：挡住穿进车体内部的弹丸，避免"穿模后从内侧命中装甲板背面"。
+    // - 位于装甲环内侧（半径 0.185 < 装甲板半径 0.21+），外侧射击仍先命中装甲板；
+    // - 只与对方弹丸碰撞（不与环境/其他车发生碰撞，避免与地面/中央平台互相穿透抖动）；
+    // - 没有 Armor 组件，命中它不计入命中统计。
+    let shield_layers = if is_local {
+        CollisionLayers::new(GameLayer::VehicleSelf, [GameLayer::ProjectileOther])
+    } else {
+        CollisionLayers::new(GameLayer::VehicleOther, [GameLayer::ProjectileSelf])
+    };
+    commands.spawn((
+        Name::new("BODY_SHIELD"),
+        Collider::cylinder(0.185, 0.45),
+        shield_layers,
+        Transform::from_xyz(0.0, 0.05, 0.0),
+        ChildOf(root),
+    ));
+
     let iter = query.of(root).any().exact("VEHICLE").flatten();
     let base = iter.clone().exact("BASE").one().unwrap();
     commands.entity(base).insert((

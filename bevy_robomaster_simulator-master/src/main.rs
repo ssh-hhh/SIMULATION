@@ -29,13 +29,13 @@ use std::sync::atomic::AtomicBool;
 
 use crate::components::{CameraMode, FollowingType, ProjectileCooldown, SubscribeAutoAim};
 use crate::config::{ConfigPlugin, SimulationConfig};
-use crate::handler::{on_activate, on_hit};
+use crate::handler::on_activate;
 use crate::robomaster::prelude::RoboMasterPlugins;
 use crate::setup::setup;
 use crate::statistic::ProjectileStatistics;
 use crate::systems::{
     ChassisObservationFrame, ControllerState, GameplaySystems, PreviousKinematicState,
-    change_appearance, cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
+    apply_armor_perturbation, change_appearance, cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
     controller_shoot_pressed, dart_launch, following_controls, freecam_controls, gimbal_controls,
     gimbal_pid_controls, projectile_aerodynamics, projectile_launch, remote_gimbal_controls,
     remote_vehicle_controls, sample_gamepad_controller, sample_keyboard_controller,
@@ -156,7 +156,6 @@ fn main() {
             TimerMode::Once,
         )))
         .add_systems(Startup, (setup, setup_projectile))
-        .add_observer(on_hit)
         .add_observer(on_activate)
         .configure_sets(
             Update,
@@ -190,7 +189,8 @@ fn main() {
                     .chain()
                     .in_set(GameplaySystems::Input),
                 // GameLogic phase
-                (change_appearance, update_help_text).in_set(GameplaySystems::GameLogic),
+                (change_appearance, update_help_text, apply_armor_perturbation)
+                    .in_set(GameplaySystems::GameLogic),
                 // Camera phase
                 (
                     freecam_controls.run_if(|mode: Res<CameraMode>| mode.0 == FollowingType::Free),

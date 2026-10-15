@@ -71,6 +71,8 @@ pub fn projectile_launch(
     let vel = infantry.1.0 + direction * config.projectile.speed;
     commands.spawn((
         RigidBody::Dynamic,
+        // 连续碰撞检测：17mm 弹丸速度快、装甲板判定盒薄，防止"穿隧漏检"
+        SweptCcd::default(),
         Collider::sphere(config.projectile.diameter / 2.0),
         Mass(config.projectile.mass),
         Friction::new(config.projectile.friction),

@@ -1,3 +1,4 @@
+mod armor_perturb;
 mod camera;
 mod chassis_observation;
 mod controller;
@@ -6,6 +7,7 @@ mod gimbal_pid;
 mod input;
 mod projectile;
 mod uav;
+pub use armor_perturb::*;
 pub use camera::*;
 pub use chassis_observation::*;
 pub use controller::*;

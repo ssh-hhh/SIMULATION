@@ -88,6 +88,19 @@ impl GameLayer {
 #[derive(Component, Deref, DerefMut)]
 pub struct ProjectileLifetime(pub Timer);
 
+/// 弹丸的"直击判定"状态：发生**第一次碰撞**前 `armed = true`。
+/// 第一次碰撞是装甲板 → 记命中；是环境/其他 → 作废（反弹后不再算命中）。
+#[derive(Component)]
+pub struct FirstContactArmed {
+    pub armed: bool,
+}
+
+impl Default for FirstContactArmed {
+    fn default() -> Self {
+        Self { armed: true }
+    }
+}
+
 #[derive(Resource, Deref, DerefMut)]
 pub struct ProjectileCooldown(pub Timer);
 

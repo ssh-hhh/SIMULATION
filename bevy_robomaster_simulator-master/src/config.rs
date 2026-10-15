@@ -3,6 +3,7 @@ use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Resource, Deserialize, Reflect, Clone)]
@@ -26,6 +27,10 @@ pub struct SimulationConfig {
     pub mecanum: MecanumConfig,
     pub projectile: ProjectileConfig,
     pub camera: CameraConfig,
+    #[serde(default)]
+    pub armor_perturb: ArmorPerturbConfig,
+    #[serde(default)]
+    pub armor_hitbox: ArmorHitboxConfig,
 }
 
 #[derive(Deserialize, Reflect, Clone)]
@@ -218,6 +223,88 @@ impl Default for MecanumConfig {
 }
 
 #[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct ArmorPerturbConfig {
+    /// 总开关：false 时恢复 GLB 原始布局（默认关闭）。
+    pub enabled: bool,
+    /// 4 块板水平半径缩放（1.0 = 原样，1.3 = 外扩 30%）。
+    pub radius_scale: f32,
+    /// 全部板统一升降（米，+ 为抬高）。
+    pub height_offset_m: f32,
+    /// 前后板对(+)/左右板对(-)的高度差（米），用来制造 EKF 的 dz。
+    pub height_stagger_m: f32,
+    /// 板子整体绕底盘轴旋转（度）：位置和朝向一起转，仍朝外。
+    pub yaw_offset_deg: f32,
+    /// 单板 / 对向板精细控制。键：1/前、2/右、3/后、4/左（也支持 front/right/back/left）。
+    #[serde(default)]
+    pub plate: HashMap<String, ArmorPlateOverride>,
+}
+
+/// 单块装甲板的偏移覆盖（叠加在全局参数之上）。
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct ArmorPlateOverride {
+    /// 沿该板半径方向外推(+) / 内收(-)，米。
+    pub radial_m: f32,
+    /// 抬高(+) / 降低(-)，米。
+    pub height_m: f32,
+    /// 绕底盘轴旋转该板（位置与朝向一起转），度。
+    pub angle_deg: f32,
+    /// 板子尺寸缩放（1.0 = 原始；<1 变小）。
+    pub size_scale: f32,
+}
+
+impl Default for ArmorPlateOverride {
+    fn default() -> Self {
+        Self {
+            radial_m: 0.0,
+            height_m: 0.0,
+            angle_deg: 0.0,
+            size_scale: 1.0,
+        }
+    }
+}
+
+impl Default for ArmorPerturbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            radius_scale: 1.0,
+            height_offset_m: 0.0,
+            height_stagger_m: 0.0,
+            yaw_offset_deg: 0.0,
+            plate: HashMap::new(),
+        }
+    }
+}
+
+/// 装甲板"判定盒"：把模型自带的装甲网格碰撞体替换成可调尺寸的长方体，
+/// 三个缩放系数按"最大边=宽、中间边=高、最小边=厚"自动对应到模型的局部轴。
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct ArmorHitboxConfig {
+    /// 板宽缩放（最大边；1.0 = 模型原样）。
+    pub width_scale: f32,
+    /// 板高缩放（中间边；≈0.46 可缩到灯条矩形高度）。
+    pub height_scale: f32,
+    /// 板厚缩放（最小边）。
+    pub thickness_scale: f32,
+    /// 用绿色半透明盒可视化判定盒。
+    pub debug_draw: bool,
+}
+
+impl Default for ArmorHitboxConfig {
+    fn default() -> Self {
+        Self {
+            width_scale: 1.0,
+            height_scale: 1.0,
+            thickness_scale: 1.0,
+            debug_draw: false,
+        }
+    }
+}
+
+#[derive(Deserialize, Reflect, Clone)]
 pub struct ProjectileConfig {
     pub lifetime: f32,
     pub speed: f32,
@@ -379,6 +466,8 @@ impl Default for SimulationConfig {
                     follow_offset: [0.0, 3.0, 2.0],
                     mouse_sensitivity: 0.003,
                 },
+                armor_perturb: ArmorPerturbConfig::default(),
+                armor_hitbox: ArmorHitboxConfig::default(),
             }
         })
     }

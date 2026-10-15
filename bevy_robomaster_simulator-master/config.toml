@@ -55,30 +55,30 @@ fixed_hz = 120.0                # fixed physics ticks per second
 substep_count = 8               # physics substeps per fixed tick
 
 [vehicle]
-rotation_speed = 7.42            # rad/s - chassis rotation speed
-yaw_acceleration = 20.0          # rad/s^2 - constant yaw acceleration (quadratic yaw curve)
+rotation_speed = 4.00            # rad/s - chassis rotation speed
+yaw_acceleration = 30.0          # rad/s^2 - constant yaw acceleration (quadratic yaw curve)
 tilt_rotation_speed = 3.0        # rad/s - chassis roll/pitch swing speed
 gimbal_rotation_speed = 3.0     # rad/s - gimbal rotation speed
 gimbal_pitch_limit = 0.785      # rad - gimbal pitch limit (~45 degrees)
-max_speed = 6.0                 # m/s - maximum vehicle speed
-linear_acceleration = 6.0       # m/s^2 - linear acceleration
+max_speed = 8.0                 # m/s - maximum vehicle speed
+linear_acceleration = 10.0       # m/s^2 - linear acceleration
 acceleration_exponent = 2.5    # exponent for non-linear acceleration curve
 
 # Closed-loop tracking of external auto-aim (Talos/ROS2) gimbal commands.
 # Yaw and pitch are independent loops with independent gains.
 [vehicle.gimbal_pid.yaw]
-kp = 25.0
+kp = 50.0
 ki = 0.0
 kd = 0.1
 integral_limit = 0.5            # rad*s - anti-windup bound on the integral term
-max_rate = 50.0                # rad/s - saturation of the commanded yaw rate
+max_rate = 100.0                # rad/s - saturation of the commanded yaw rate
 
 [vehicle.gimbal_pid.pitch]
-kp = 15.0
+kp = 50.0
 ki = 0.0
 kd = 0.1
 integral_limit = 0.5            # rad*s - anti-windup bound on the integral term
-max_rate = 10.0                # rad/s - saturation of the commanded pitch rate
+max_rate = 100.0                # rad/s - saturation of the commanded pitch rate
 
 [mecanum]
 wheel_radius_m = 0.076          # wheel radius (m)
@@ -87,7 +87,7 @@ half_trackwidth_m = 0.15        # half of left-right wheel spacing (m)
 
 [projectile]
 lifetime = 5.0                  # seconds - projectile lifetime
-speed = 25.0                    # m/s - initial speed
+speed = 12.0                    # m/s - initial speed
 cooldown = 0.05                  # seconds - fire cooldown
 diameter = 0.017                # meters - projectile diameter (17mm)
 mass = 0.0032                    # kg - projectile mass (17g)
@@ -106,3 +106,40 @@ fov = 45.0                      # degrees - field of view
 free_move_speed = 8.0           # m/s - free camera movement speed
 follow_offset = [0.0, 3.0, 2.0] # follow camera offset
 mouse_sensitivity = 0.003       # mouse look sensitivity
+
+# 装甲板布局扰动（测试用）：只影响蓝色假人（步兵 + 英雄），默认关闭。
+# 改完保存即热重载生效（日志出现 Config reloaded successfully）；恢复原样把 enabled 改回 false。
+# 用途：制造"模型失配"来验证 DGE 的 EKF（r1/l/dz 估计）、PnP 测距与选板逻辑。
+[armor_perturb]
+enabled = true                 # 总开关
+radius_scale = 1.2              # 4 块板水平半径缩放（1.3 = 外扩 30%）
+height_offset_m = 0.0           # 全部板统一升降（米，+ 为抬高）
+height_stagger_m = -0.08          # 前后板对(+)/左右板对(-)的高度差（米），制造 dz
+
+# —— 单板 / 对向板精细控制（可选）——
+# 板编号以车头（炮口）方向为准顺时针：1=前、2=右、3=后、4=左；步兵/英雄通用。
+# 每块可单独设：radial_m 外推(+)/内收(-) 米；
+#             height_m 抬高(+)/降低(-) 米；
+#             angle_deg 绕底盘轴旋转该板（位置+朝向，度）；
+#             size_scale 尺寸缩放（1=原始）；
+# 启动日志会打印每块板的编号与方位角，可据此核对。
+[armor_perturb.plate]
+
+# 单块示例（前板抬高 6cm）：
+# 1 = { height_m = 0.00 }
+
+# 对向板示例（右 + 左两块各外扩 4cm）：
+# 2 = { radial_m = 0.04 }
+# 4 = { radial_m = 0.04 }
+
+# —— 装甲板判定盒（控制"打在哪里才算命中"）——
+# 把模型自带的装甲网格碰撞体替换成可调尺寸的长方体；系数按
+# "最大边=宽、中间边=高、最小边=厚"自动对应到模型局部轴（步兵/英雄通用）。
+# 只影响撞击判定，不改模型外观；配合"直击才算命中"的规则使用。
+# 例：缩到灯条矩形高度（DGE 检测的目标区域）→ height_scale = 0.46
+[armor_hitbox]
+width_scale = 0.5               # 板宽缩放（1.0 = 模型原样）
+height_scale = 0.3              # 板高缩放
+thickness_scale = 1.0           # 板厚缩放
+debug_draw = false              # 绿色半透明盒可视化判定盒
+

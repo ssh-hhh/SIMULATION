@@ -22,6 +22,7 @@ cd "$DGE" && ./build/standard configs/daedalus.yaml
 | 文档 | 内容 |
 |---|---|
 | **DGE_部署Daedalus仿真指南.md** | 部署、适配层原理、配置、验证自检、常见问题 |
+| **DGE性能测试教程.md** | 性能/EKF 测试操作流程、`config.toml` 参数手册、实验记录表 |
 | **Foxglove使用说明.md** | 连接、话题、3D 场景/曲线判读、调试工作流、FAQ |
 | **环境配置与使用指南.md** | 依赖安装（apt/Rust/CMake/OpenVINO）、踩坑、按键 |
 | `DGE/foxglove_layouts/README.md` | 布局文件与话题对照 |

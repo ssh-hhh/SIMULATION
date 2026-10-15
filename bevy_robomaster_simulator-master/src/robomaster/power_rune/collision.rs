@@ -8,7 +8,7 @@ use bevy::prelude::{
 use std::collections::HashSet;
 
 #[derive(Component)]
-#[require(CollisionEventsEnabled)]
+#[require(CollisionEventsEnabled, crate::components::FirstContactArmed)]
 pub struct Projectile;
 
 #[derive(Resource, Default)]
